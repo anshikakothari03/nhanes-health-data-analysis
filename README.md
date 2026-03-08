@@ -84,15 +84,15 @@ Tools and Libraries
 
 The analysis was performed using the R programming language with libraries such as:
 
-dplyr
+- dplyr
 
-ggplot2
+- ggplot2
 
-tidyr
+- tidyr
 
-corrplot
+- corrplot
 
-e1071
+- e1071
 
 
 ## Project Note
