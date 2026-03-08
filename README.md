@@ -70,4 +70,35 @@ Model diagnostics were also performed to evaluate assumptions and model quality.
 
 The analysis revealed several important relationships:
 
-* Age, BMI, and systolic blood pressure are strong predictors of diab
+* Age, BMI, and systolic blood pressure are strong predictors of diabetes risk
+
+Higher BMI levels are associated with increased HbA1c values
+
+Blood pressure and diabetes prevalence show significant statistical associations
+
+Some lifestyle and demographic variables appear to influence long-term health outcomes
+
+These findings highlight the importance of weight management and cardiovascular health in reducing diabetes risk.
+
+Tools and Libraries
+
+The analysis was performed using the R programming language with libraries such as:
+
+dplyr
+
+ggplot2
+
+tidyr
+
+corrplot
+
+e1071
+
+
+## Project Note
+
+This project was completed as part of a group academic assignment. The analysis and report were developed collaboratively with teammates. The repository contains the analysis code and dataset used in the project.
+
+## Author
+
+Anshika Kothari
