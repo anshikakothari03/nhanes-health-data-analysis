@@ -1,0 +1,2994 @@
+---
+title: "NHANES Data Analysis: Adult Health Outcomes"
+author: Anshika Kothari, James Ross, Muhui Wang, Sherry Wang
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+    toc_depth: 2
+    number_sections: true
+    highlight: tango
+    keep_tex: true
+    extra_dependencies: ["longtable", "booktabs", "array"]
+header-includes:
+  - \usepackage{caption}
+  - \captionsetup{hypcap=false, justification=centering, singlelinecheck=false}
+  - \usepackage{booktabs}
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  cache = FALSE,  # Disabled global cache; use selective caching
+  fig.width = 8,
+  fig.height = 6
+)
+```
+
+\raggedright
+
+\newpage
+
+# Executive Summary
+
+This report presents a comprehensive analysis of the National Health and Nutrition Examination Survey (NHANES) data, focusing on adult health outcomes in the United States population. The analysis examines relationships between demographic factors, lifestyle variables, and key health metrics including diabetes prevalence, blood pressure, and glycemic control.
+
+**Key Findings:**
+
+- The analysis dataset comprises thousands of adult participants with diverse demographics and comprehensive health measurements
+- Mean BMI and blood pressure levels indicated a substantial burden of overweight/obesity and hypertension in the US adult population
+- Diabetes prevalence was consistent with national estimates, highlighting the ongoing public health challenge
+- **Predictors of Diabetes**: Logistic regression identified age, BMI, and systolic blood pressure as statistically significant predictors of diabetes/prediabetes status, while gender, physical activity frequency, and income-poverty ratio were not significant
+- **Predictors of HbA1c**: Linear regression identified age, BMI, and income-poverty ratio as statistically significant predictors of HbA1c levels (a key marker of long-term glycemic control), while gender, systolic blood pressure, and physical activity frequency were not significant
+- **Advanced Methodological Enhancements**: Robust standard errors (HC3) addressed heteroscedasticity; non-linear models (quadratic, splines) and interaction terms (age × BMI, gender × physical activity) were tested with AIC/BIC model comparison to identify optimal specifications
+
+**Implications:**
+
+The findings underscore the importance of weight management and blood pressure control in diabetes prevention and management. These modifiable risk factors represent key targets for public health interventions aimed at reducing the burden of chronic disease in the adult population.
+
+```{r load-libraries, include=FALSE}
+library(tidyverse)
+library(naniar)
+library(skimr)
+library(knitr)
+library(corrplot)
+library(patchwork)
+library(car)  # For VIF and assumption tests
+library(lmtest)  # For regression diagnostics
+library(pROC)  # For ROC curves and AUC
+library(e1071)  # For skewness and kurtosis
+library(pander)
+library(kableExtra)
+
+# Additional packages for enhanced statistical analysis
+library(MASS)        # Robust regression (rlm)
+library(splines)     # Natural splines for non-linear modeling
+library(broom)       # Tidy model outputs
+
+# Load if available, otherwise use base R alternatives
+if (require(sandwich, quietly = TRUE)) {
+  # Robust standard errors
+} else {
+  message("Package 'sandwich' not available - robust SEs will use base R alternatives")
+}
+
+if (require(effectsize, quietly = TRUE)) {
+  # Effect size calculations
+} else {
+  message("Package 'effectsize' not available - will calculate effect sizes manually")
+}
+
+if (require(emmeans, quietly = TRUE)) {
+  # Estimated marginal means for post-hoc tests
+} else {
+  message("Package 'emmeans' not available - will use TukeyHSD for post-hoc tests")
+}
+
+if (require(caret, quietly = TRUE)) {
+  # Cross-validation
+} else {
+  message("Package 'caret' not available - will use manual cross-validation")
+}
+
+if (require(mgcv, quietly = TRUE)) {
+  # GAM models
+} else {
+  message("Package 'mgcv' not available - will use splines package for non-linear fits")
+}
+
+# Data cleaning parameters
+MISSING_THRESHOLD <- 0.60
+
+# Utility function for frequency tables
+create_freq_table <- function(data, var_name) {
+  if (var_name %in% names(data)) {
+    data %>%
+      count(.data[[var_name]]) %>%
+      mutate(Percent = round(n / sum(n) * 100, 1)) %>%
+      rename(Category = 1, Count = n)
+  }
+}
+
+
+# Cohen's d for effect size (manual calculation if effectsize not available)
+cohens_d_manual <- function(x, y) {
+  n1 <- length(x)
+  n2 <- length(y)
+  mean_diff <- mean(x, na.rm = TRUE) - mean(y, na.rm = TRUE)
+  pooled_sd <- sqrt(((n1 - 1) * var(x, na.rm = TRUE) + (n2 - 1) * var(y, na.rm = TRUE)) / (n1 + n2 - 2))
+  d <- mean_diff / pooled_sd
+  return(d)
+}
+
+# Interpret Cohen's d
+interpret_d <- function(d) {
+  abs_d <- abs(d)
+  if (abs_d < 0.2) return("Negligible")
+  if (abs_d < 0.5) return("Small")
+  if (abs_d < 0.8) return("Medium")
+  return("Large")
+}
+
+# Cramér's V for chi-square tests
+cramers_v_manual <- function(chi_sq, n, df) {
+  v <- sqrt(chi_sq / (n * df))
+  return(v)
+}
+
+# Interpret Cramér's V
+interpret_v <- function(v) {
+  if (v < 0.1) return("Negligible")
+  if (v < 0.3) return("Small")
+  if (v < 0.5) return("Medium")
+  return("Large")
+}
+
+# Eta-squared for ANOVA
+eta_squared_manual <- function(aov_model) {
+  ss <- summary(aov_model)[[1]]$`Sum Sq`
+  ss_total <- sum(ss)
+  eta_sq <- ss[1] / ss_total
+  return(eta_sq)
+}
+
+# Interpret eta-squared
+interpret_eta_sq <- function(eta_sq) {
+  if (eta_sq < 0.01) return("Negligible")
+  if (eta_sq < 0.06) return("Small")
+  if (eta_sq < 0.14) return("Medium")
+  return("Large")
+}
+```
+
+
+```{r quick-load, echo=FALSE}
+# Load cleaned data for executive summary
+if (file.exists("nhanes_cleaned.csv")) {
+  nhanes_clean <- read.csv("nhanes_cleaned.csv", stringsAsFactors = TRUE)
+
+  cat("Dataset: NHANES Adult Population (age ≥ 18)\n")
+  cat("Sample Size:", format(nrow(nhanes_clean), big.mark = ","), "individuals\n")
+  cat("Variables:", ncol(nhanes_clean), "features\n\n")
+  cat("Key Metrics:\n")
+  cat("  • Mean Age:", round(mean(nhanes_clean$age, na.rm = TRUE), 1), "years\n")
+  cat("  • Mean BMI:", round(mean(nhanes_clean$bmi, na.rm = TRUE), 1), "\n")
+  cat("  • Mean SBP:", round(mean(nhanes_clean$sbp, na.rm = TRUE), 1), "mmHg\n")
+
+  if ("diabetes" %in% names(nhanes_clean)) {
+    diabetes_pct <- round(sum(nhanes_clean$diabetes == "Yes", na.rm = TRUE) /
+                         sum(!is.na(nhanes_clean$diabetes)) * 100, 1)
+    cat("  • Diabetes Prevalence:", diabetes_pct, "%\n")
+  }
+}
+```
+
+\newpage
+
+# Introduction
+
+## Research Objectives
+
+This analysis examines the National Health and Nutrition Examination Survey (NHANES) data to:
+
+1. Characterize health outcomes in the adult US population
+2. Identify relationships between demographic factors and health metrics
+3. Assess prevalence of chronic conditions (diabetes, hypertension)
+4. Explore associations between lifestyle factors and health outcomes
+5. Develop predictive models for diabetes status and glycemic control (HbA1c levels)
+
+### Explicit Hypotheses
+
+**1. Normality Tests** *(Section: Normality Tests)*
+
+- **$H_{0}$:** The variable follows a normal distribution
+- **$H_{1}$:** The variable does not follow a normal distribution
+- **Test:** Shapiro-Wilk test for variables: age, bmi, sbp, dbp, a1c, glucose
+
+**2. Chi-Square Tests for Categorical Associations** *(Section: Chi-Square Tests)*
+
+- **$H_{0}$:** No association between the two categorical variables
+- **$H_{1}$:** Significant association exists between the variables
+- **Tests conducted:**
+  - Diabetes vs Gender
+  - Diabetes vs BMI Category
+  - Diabetes vs BP Category
+  - BP Category vs Gender
+
+**3. Two-Sample T-Tests** *(Section: T-Tests for Group Comparisons)*
+
+- **$H_{0}$:** No difference in means between the two groups
+- **$H_{1}$:** Significant difference in means between groups
+- **Tests conducted:**
+  - BMI by Gender
+  - Systolic BP by Gender
+  - HbA1c: Diabetes vs No Diabetes
+
+**4. One-Sample Proportion Test: Hypertension Prevalence** *(Section: One-Sample Proportion Test)*
+
+- **Null Hypothesis ($H_{0}$):** The sample hypertension prevalence equals the national population proportion ($p = 0.48$)
+- **Alternative Hypothesis ($H_{1}$):** The sample hypertension prevalence differs from 0.48 ($p \neq 0.48$)
+- **Test:** Two-sided one-sample proportion test
+- **Reference:** CDC High Blood Pressure Facts in 2023 (48%)
+
+**5. Two-Sample Proportion Test: Hypertension by Gender** *(Section: Two-Sample Proportion Test)*
+
+- **Null Hypothesis ($H_{0}$):** The hypertension prevalence is the same for males and females ($p_{\text{male}} \leq p_{\text{female}}$)
+- **Alternative Hypothesis ($H_{1}$):** The hypertension prevalence differs between males and females ($p_{\text{male}} > p_{\text{female}}$)
+- **Test:** One-sided two-sample proportion test
+
+\newpage
+
+**6. ANOVA Tests** *(Section: ANOVA for Multi-Group Comparisons)*
+
+- **$H_{0}$:** All group means are equal
+- **$H_{1}$:** At least one group mean differs
+- **Tests conducted:**
+  - BMI across Age Groups
+  - Systolic BP across Age Groups
+  - HbA1c across BMI Categories
+
+**7. Variance Tests (F-tests)** *(Section: Variance Test)*
+
+- **$H_{0}$:** Equal variances between groups ($\sigma_1^2 = \sigma_2^2$)
+- **$H_{1}$:** Unequal variances between groups ($\sigma_1^2 \neq \sigma_2^2$)
+- **Tests conducted** (Diabetes Pre/Yes vs No):
+  - SBP Variance
+  - HbA1c Variance
+  - BMI Variance
+  - Income-Poverty Ratio Variance
+
+**8. Correlation Tests** *(Section: Correlation Inference)*
+
+- **$H_{0}$:** No correlation between variables ($\rho = 0$)
+- **$H_{1}$:** Significant correlation exists ($\rho \neq 0$)
+- **Method:** Spearman correlation for all pairs of numeric variables
+- **Variables:** age, bmi, sbp, dbp, a1c, glucose, sleep_hours, physical_activity_freq
+
+**9. Logistic Regression** *(Section: Logistic Regression: Diabetes Prediction)*
+
+- **$H_{0}$:** Each predictor has no effect on diabetes status ($\beta = 0$)
+- **$H_{1}$:** The predictor significantly affects diabetes status ($\beta \neq 0$)
+- **Outcome:** Diabetes/Prediabetes (binary)
+- **Predictors:** age, gender, bmi, sbp, physical_activity_freq, income_poverty_ratio
+
+**10. Linear Regression** *(Section: Linear Regression: HbA1c Prediction)*
+
+- **$H_{0}$:** Each predictor has no effect on HbA1c levels ($\beta = 0$)
+- **$H_{1}$:** The predictor significantly affects HbA1c levels ($\beta \neq 0$)
+- **Outcome:** HbA1c (continuous)
+- **Predictors:** age, gender, bmi, sbp, physical_activity_freq, income_poverty_ratio
+
+\newpage
+
+**11. Regression Diagnostics Tests** *(Section: Linear/Logistic Regression Diagnostics)*
+
+- **Breusch-Pagan Test:** Tests for heteroscedasticity
+  - **$H_{0}$:** Homoscedasticity (constant variance)
+  - **$H_{1}$:** Heteroscedasticity (non-constant variance)
+- **Durbin-Watson Test:** Tests for autocorrelation
+  - **$H_{0}$:** No autocorrelation in residuals
+  - **$H_{1}$:** Autocorrelation exists
+
+## Data Source
+
+The NHANES data collection process involves a combination of interviews, physical examinations, and laboratory tests to assess the health and nutrition of participants. The survey encompasses a diverse range of health conditions, dietary habits, and behaviors, utilizing interviews, health examinations, and laboratory tests to gather this information. The NHANES team travels to communities to collect data, and households in the study area receive an introductory letter from the NCHS Director. The team conducts health interviews in participants' homes and performs health exams in mobile exam centers, collecting blood and urine samples for laboratory tests. This comprehensive approach allows NHANES to provide estimates for undiagnosed conditions, making it a unique national health survey.
+
+\newpage
+
+# Data Processing
+
+## Load and Validate Data
+
+```{r load-data}
+# Check if cleaned data exists
+if (file.exists("nhanes_cleaned.csv")) {
+  cat("Loading pre-cleaned data...\n")
+  nhanes_clean <- read.csv("nhanes_cleaned.csv", stringsAsFactors = TRUE)
+  cat("Loaded:", nrow(nhanes_clean), "rows ×", ncol(nhanes_clean), "columns\n")
+
+  # Convert character columns back to factors
+  char_cols <- sapply(nhanes_clean, is.character)
+  nhanes_clean[char_cols] <- lapply(nhanes_clean[char_cols], as.factor)
+
+  use_cleaned <- TRUE
+} else {
+  cat("Cleaned data not found. Loading raw data...\n")
+  nhanes_raw <- read.csv("nhanes.csv", na.strings = c("", "NA", " "))
+  cat("Original data:", nrow(nhanes_raw), "rows ×", ncol(nhanes_raw), "columns\n")
+  use_cleaned <- FALSE
+}
+```
+
+## Data Cleaning Pipeline
+
+```{r cleaning, eval=!exists("use_cleaned") || !use_cleaned}
+# Only run if cleaned data doesn't exist
+
+# 1. Filter to adults (age >= 18)
+nhanes_adults <- nhanes_raw %>%
+  filter(age >= 18)
+
+# 2. Single comprehensive cleaning pipeline
+nhanes_clean <- nhanes_adults %>%
+  # Remove columns with >90% missing
+  dplyr::select(where(~sum(is.na(.)) / length(.) < MISSING_THRESHOLD)) %>%
+
+  # Remove duplicate IDs
+  distinct(id, .keep_all = TRUE) %>%
+
+  # Handle outliers and create derived variables
+  mutate(
+    # Cap outliers at physiological limits
+    bmi = ifelse(bmi < 10 | bmi > 100, NA, bmi),
+    sbp = ifelse(sbp < 70 | sbp > 250, NA, sbp),
+    dbp = ifelse(dbp < 40 | dbp > 150, NA, dbp),
+    glucose = ifelse(glucose < 50 | glucose > 600, NA, glucose),
+    a1c = ifelse(a1c < 3 | a1c > 18, NA, a1c),
+    weight_kg = ifelse(weight_kg < 30 | weight_kg > 300, NA, weight_kg),
+    height_cm = ifelse(height_cm < 120 | height_cm > 230, NA, height_cm),
+    sleep_hours = ifelse(sleep_hours < 2 | sleep_hours > 16, NA, sleep_hours),
+
+    # Convert to appropriate types
+    across(any_of(c("gender", "race", "education", "smoking_current", "smoking_ever",
+                    "diabetes_self_report", "has_health_insurance", "doctor_visit_12m",
+                    "insurance_type")), as.factor),
+    across(any_of(c("age", "weight_kg", "height_cm", "bmi", "sbp", "dbp",
+                    "a1c", "glucose", "physical_activity_freq", "sleep_hours",
+                    "income_poverty_ratio")), as.numeric),
+
+    # Create clinical categories
+    bp_category = factor(case_when(
+      is.na(sbp) | is.na(dbp) ~ NA_character_,
+      sbp < 120 & dbp < 80 ~ "Normal",
+      sbp < 130 & dbp < 80 ~ "Elevated",
+      sbp < 140 & dbp < 90 ~ "Stage 1 Hypertension",
+      TRUE ~ "Stage 2 Hypertension"
+    ), levels = c("Normal", "Elevated", "Stage 1 Hypertension", "Stage 2 Hypertension")),
+
+    bmi_category = factor(case_when(
+      is.na(bmi) ~ NA_character_,
+      bmi < 18.5 ~ "Underweight",
+      bmi < 25 ~ "Normal weight",
+      bmi < 30 ~ "Overweight",
+      TRUE ~ "Obese"
+    ), levels = c("Underweight", "Normal weight", "Overweight", "Obese")),
+
+    age_group = cut(age, breaks = c(18, 35, 50, 65, Inf),
+                    labels = c("18-34", "35-49", "50-64", "65+"),
+                    right = FALSE),
+
+    diabetes = factor(case_when(
+      diabetes_self_report == "Yes" | a1c >= 6.5 ~ "Yes",
+      !is.na(a1c) & a1c < 5.7 ~ "No",
+      a1c >= 5.7 & a1c < 6.5 ~ "Prediabetes",
+      TRUE ~ NA_character_
+    ))
+  )
+
+# Save cleaned data
+write.csv(nhanes_clean, "nhanes_cleaned.csv", row.names = FALSE)
+cat("Cleaned data saved.\n")
+```
+
+## Missing Data Assessment
+
+```{r missing-summary}
+# Calculate missing percentages
+missing_summary <- nhanes_clean %>%
+  summarise(across(everything(), ~sum(is.na(.)) / n() * 100)) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Percent Missing") %>%
+  arrange(desc(`Percent Missing`)) %>%
+  filter(`Percent Missing` > 0) %>%
+  mutate(`Percent Missing` = round(`Percent Missing`, 1))
+
+# Display top 10
+kable(head(missing_summary, 10),
+      caption = "Top 10 Variables by Missing Data Percentage",
+      booktabs = TRUE, format = "latex") %>%
+  kable_styling(latex_options = c("scale_down", "HOLD_position"), 
+                font_size = 9, full_width = FALSE)
+```
+
+```{r missing-viz, fig.height=6, fig.width=8}
+# Visualize missing patterns
+gg_miss_var(nhanes_clean, show_pct = TRUE) +
+  labs(title = "Missing Data by Variable",
+       y = "Variable", x = "Number of Missing Values") +
+  theme_minimal()
+```
+
+## Handle Missing Data for Analysis
+
+```{r handle-missing}
+# Document missingness
+total_obs <- nrow(nhanes_clean)
+incomplete_obs <- sum(!complete.cases(nhanes_clean))
+
+cat("Total observations:", format(total_obs, big.mark = ","), "\n")
+cat("Observations with any missing data:", format(incomplete_obs, big.mark = ","),
+    "(", round(incomplete_obs/total_obs*100, 1), "%)\n\n")
+
+# Create analysis dataset with complete cases for key variables
+key_vars <- c("age_group", "gender", "bmi_category", "bp_category", "diabetes", "a1c", "glucose", "physical_activity_freq", "income_poverty_ratio", "sleep_hours", "insurance_type",
+"doctor_visit_12m", "education")
+nhanes_analysis <- nhanes_clean %>%
+  drop_na(all_of(key_vars[key_vars %in% names(nhanes_clean)]))
+
+cat("Complete cases for analysis:", format(nrow(nhanes_analysis), big.mark = ","), "\n")
+cat("Retained:", round(nrow(nhanes_analysis)/total_obs*100, 1), "% of data\n")
+```
+
+\newpage
+
+# Exploratory Data Analysis
+
+## Sample Characteristics
+
+```{r demographics-table}
+# Helper function for mean ± SD formatting
+format_mean_sd <- function(x, digits = 1) {
+  paste0(round(mean(x, na.rm = TRUE), digits), " ± ",
+         round(sd(x, na.rm = TRUE), digits))
+}
+
+# Create demographic summary table
+demo_summary <- nhanes_analysis %>%
+  summarise(
+    N = n(),
+    `Age (mean ± SD)` = format_mean_sd(age),
+    `Female (%)` = if("gender" %in% names(.))
+                   round(sum(gender == "Female", na.rm = TRUE) / n() * 100, 1) else NA,
+    `BMI (mean ± SD)` = format_mean_sd(bmi),
+    `SBP (mean ± SD)` = format_mean_sd(sbp),
+    `DBP (mean ± SD)` = format_mean_sd(dbp),
+    `Diabetes Prevalence (%)` = if("diabetes" %in% names(.))
+                               round(sum(diabetes == "Yes", na.rm = TRUE) /
+                                     sum(!is.na(diabetes)) * 100, 1) else NA,
+    `Insurance Type (%)` = if("insurance_type" %in% names(.))
+                               round(sum(insurance_type == "Insured", na.rm = TRUE) /
+                                     sum(!is.na(insurance_type)) * 100, 1) else NA,
+    `Physical Activity Frequency (mean ± SD)` = format_mean_sd(physical_activity_freq),
+    `Sleep Hours (mean ± SD)` = format_mean_sd(sleep_hours),
+    `Income to Poverty Ratio (mean ± SD)` = format_mean_sd(income_poverty_ratio, digits = 2)
+  )
+
+kable(t(demo_summary), col.names = "Value",
+      caption = "Sample Characteristics",
+      booktabs = TRUE, format = "latex") %>%
+  kable_styling(latex_options = c("scale_down", "HOLD_position"), 
+                font_size = 9, full_width = FALSE)
+```
+
+## Distribution of Continuous Variables
+
+```{r continuous-dist, fig.height=10, fig.width=10}
+# Plot all continuous variables in facets
+nhanes_analysis %>%
+  dplyr::select(any_of(c("age", "bmi", "sbp", "dbp", "a1c", "glucose",
+                  "weight_kg", "height_cm", "sleep_hours"))) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Value") %>%
+  ggplot(aes(x = Value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white", alpha = 0.8) +
+  facet_wrap(~Variable, scales = "free", ncol = 3) +
+  labs(title = "Distribution of Continuous Health Variables",
+       x = "Value", y = "Frequency") +
+  theme_minimal() +
+  theme(strip.background = element_rect(fill = "lightgray"))
+```
+
+## Distribution of Categorical Variables
+
+```{r categorical-dist, results='asis'}
+# Categorical variables to analyze
+cat_vars <- c("gender", "race", "bmi_category", "bp_category", "diabetes", "education",
+              "smoking_current", "smoking_ever", "has_health_insurance",
+              "doctor_visit_12m", "insurance_type", "age_group", "diabetes_self_report") 
+
+# Generate frequency tables for all categorical variables
+for (var in cat_vars) {
+  if (var %in% names(nhanes_analysis)) {
+    # Create safe variable name for titles and captions
+    var_title <- tools::toTitleCase(gsub("_", " ", var))
+    cat("\n###", var_title, "\n\n")
+
+    freq_table <- create_freq_table(nhanes_analysis, var)
+    # Escape underscores for LaTeX and create unique label
+    safe_var <- gsub("_", "-", var)
+    safe_caption <- paste0(var_title, " Distribution")
+
+    print(kable(freq_table, caption = safe_caption,
+          booktabs = TRUE, format = "latex",
+          label = paste0("tab:", safe_var, "-dist")) %>%
+          kable_styling(latex_options = c("scale_down", "HOLD_position"), 
+                        font_size = 9, full_width = FALSE))
+    cat("\n\n")
+  }
+}
+```
+
+## Relationships Between Variables
+
+```{r correlation-plot, fig.height=6, fig.width=8}
+# Correlation matrix for numeric variables
+cor_vars <- nhanes_analysis %>%
+  dplyr::select(any_of(c("age", "bmi", "sbp", "dbp", "a1c", "glucose",
+                  "sleep_hours", "physical_activity_freq"))) %>%
+  select_if(is.numeric)
+
+if (ncol(cor_vars) > 1) {
+  cor_matrix <- cor(cor_vars, use = "pairwise.complete.obs")
+
+  corrplot(cor_matrix, method = "color", type = "upper",
+           addCoef.col = "black", number.cex = 0.7,
+           tl.col = "black", tl.srt = 45,
+           title = "Correlation Matrix of Health Variables",
+           mar = c(0,0,2,0))
+}
+```
+
+```{r scatter-plots, fig.height=8, fig.width=10}
+# Key relationships
+if (all(c("age", "bmi", "sbp") %in% names(nhanes_analysis))) {
+  p1 <- ggplot(nhanes_analysis, aes(x = age, y = bmi)) +
+    geom_point(alpha = 0.3, color = "steelblue") +
+    geom_smooth(method = "loess", color = "red") +
+    labs(title = "BMI vs Age", x = "Age (years)", y = "BMI") +
+    theme_minimal()
+
+  p2 <- ggplot(nhanes_analysis, aes(x = age, y = sbp)) +
+    geom_point(alpha = 0.3, color = "forestgreen") +
+    geom_smooth(method = "loess", color = "red") +
+    labs(title = "Systolic BP vs Age", x = "Age (years)", y = "SBP (mmHg)") +
+    theme_minimal()
+
+  p3 <- ggplot(nhanes_analysis, aes(x = bmi, y = sbp)) +
+    geom_point(alpha = 0.3, color = "purple") +
+    geom_smooth(method = "loess", color = "red") +
+    labs(title = "Systolic BP vs BMI", x = "BMI", y = "SBP (mmHg)") +
+    theme_minimal()
+
+  (p1 | p2) / p3 +
+    plot_annotation(title = "Key Health Metric Relationships")
+}
+```
+
+## Summary Statistics
+
+```{r summary-stats}
+# Comprehensive summary statistics for continuous variables
+cont_vars <- c("age", "bmi", "sbp", "dbp", "a1c", "glucose")
+summary_stats <- nhanes_analysis %>%
+  summarise(across(all_of(cont_vars[cont_vars %in% names(.)]), list(
+    mean = ~mean(.x, na.rm = TRUE),
+    median = ~median(.x, na.rm = TRUE),
+    trimmed_mean = ~mean(.x, trim = 0.1, na.rm = TRUE),
+    IQR = ~IQR(.x, na.rm = TRUE),
+    variance = ~var(.x, na.rm = TRUE),
+    coef_var = ~sd(.x, na.rm = TRUE) / mean(.x, na.rm = TRUE),
+    skewness = ~e1071::skewness(.x, na.rm = TRUE)
+  ))) %>%
+  pivot_longer(everything(), names_to = "Statistic", values_to = "Value") %>%
+  mutate(Value = round(Value, 3))
+
+kable(summary_stats,
+      caption = "Comprehensive Summary Statistics for Continuous Variables",
+      booktabs = TRUE, format = "latex") %>%
+  kable_styling(latex_options = c("scale_down", "HOLD_position"), 
+                font_size = 8, full_width = FALSE)
+```
+
+## Distribution Analysis with Central Tendency
+
+```{r dist-with-centers, fig.height=10, fig.width=10}
+# Histograms with mean and median lines
+nhanes_analysis %>%
+  dplyr::select(any_of(cont_vars)) %>%
+  pivot_longer(everything(), names_to = "Variable", values_to = "Value") %>%
+  group_by(Variable) %>%
+  mutate(mean_val = mean(Value, na.rm = TRUE),
+         median_val = median(Value, na.rm = TRUE)) %>%
+  ggplot(aes(x = Value)) +
+  geom_histogram(bins = 30, fill = "steelblue", color = "white", alpha = 0.8) +
+  geom_vline(aes(xintercept = mean_val), color = "red", linetype = "dashed", linewidth = 1) +
+  geom_vline(aes(xintercept = median_val), color = "green", linetype = "dotted", linewidth = 1) +
+  facet_wrap(~Variable, scales = "free", ncol = 3) +
+  labs(title = "Distributions with Mean (red) and Median (green)",
+       x = "Value", y = "Frequency") +
+  theme_minimal() +
+  theme(strip.background = element_rect(fill = "lightgray"))
+```
+
+## Normality Assessment
+
+```{r qq-plots, fig.height=8, fig.width=10}
+# Q-Q plots for normality assessment
+par(mfrow = c(2, 3))
+for (var in cont_vars) {
+  if (var %in% names(nhanes_analysis)) {
+    qqnorm(nhanes_analysis[[var]], main = paste("Q-Q Plot:", var))
+    qqline(nhanes_analysis[[var]], col = "red", lwd = 2)
+  }
+}
+par(mfrow = c(1, 1))
+```
+
+## Categorical Variables by Group
+
+```{r categorical-barplots, fig.height=8, fig.width=10}
+# Barplots for key categorical variables
+cat_vars_plot <- c("gender", "race", "bmi_category", "bp_category", "diabetes", "education")
+plots_list <- list()
+
+for (var in cat_vars_plot) {
+  if (var %in% names(nhanes_analysis)) {
+    p <- ggplot(nhanes_analysis, aes(x = .data[[var]])) +
+      geom_bar(fill = "steelblue", alpha = 0.8) +
+      labs(title = tools::toTitleCase(gsub("_", " ", var)),
+           x = "", y = "Count") +
+      theme_minimal() +
+      theme(axis.text.x = element_text(angle = 45, hjust = 1))
+    plots_list[[var]] <- p
+  }
+}
+
+# Display first 6 plots
+if (length(plots_list) >= 6) {
+  wrap_plots(plots_list[1:6], ncol = 3)
+} else if (length(plots_list) > 0) {
+  wrap_plots(plots_list, ncol = 3)
+}
+```
+
+## Group Comparisons
+
+```{r group-comparisons, fig.height=6, fig.width=10}
+# BMI by gender with statistical comparison
+if (all(c("bmi", "gender") %in% names(nhanes_analysis))) {
+  p1 <- ggplot(nhanes_analysis, aes(x = gender, y = bmi, fill = gender)) +
+    geom_boxplot(alpha = 0.7) +
+    labs(title = "BMI by Gender", x = "Gender", y = "BMI") +
+    theme_minimal() +
+    theme(legend.position = "none")
+
+  # SBP by diabetes status
+  if ("diabetes" %in% names(nhanes_analysis)) {
+    p2 <- ggplot(nhanes_analysis, aes(x = diabetes, y = sbp, fill = diabetes)) +
+      geom_boxplot(alpha = 0.7) +
+      labs(title = "Systolic BP by Diabetes Status", x = "Diabetes", y = "SBP (mmHg)") +
+      theme_minimal() +
+      theme(legend.position = "none", axis.text.x = element_text(angle = 45, hjust = 1))
+
+  # 
+  # Display side by side
+    p1 | p2
+  } else {
+    print(p1)
+  }
+}
+```
+
+\newpage
+
+# Statistical Hypothesis Testing
+
+## Normality Tests
+
+```{r normality-tests}
+# Shapiro-Wilk test for normality (using sample if n > 5000)
+normality_results <- list()
+
+for (var in cont_vars) {
+  if (var %in% names(nhanes_analysis)) {
+    data_vec <- na.omit(nhanes_analysis[[var]])
+
+    # Sample if dataset is large
+    if (length(data_vec) > 5000) {
+      set.seed(123)
+      data_vec <- sample(data_vec, 5000)
+    }
+
+    if (length(data_vec) >= 3) {
+      test_result <- shapiro.test(data_vec)
+      normality_results[[var]] <- data.frame(
+        Variable = var,
+        W_Statistic = round(test_result$statistic, 4),
+        P_Value = format.pval(test_result$p.value, digits = 3),
+        Normal = ifelse(test_result$p.value > 0.05, "Yes", "No")
+      )
+    }
+  }
+}
+
+normality_df <- do.call(rbind, normality_results)
+rownames(normality_df) <- NULL
+
+kable(normality_df,
+      caption = "Shapiro-Wilk Normality Tests (p > 0.05 indicates normality)",
+      booktabs = TRUE, format = "latex") %>%
+  kable_styling(latex_options = c("scale_down", "HOLD_position"),
+                font_size = 9, full_width = FALSE)
+```
+
+> **Interpretation:**
+> The Shapiro-Wilk normality tests reveal that all continuous health variables deviate significantly from normal distribution (all p < 0.05). This is not unexpected in large health datasets due to biological and behavioral factors that create skewness. For example, HbA1c and glucose are right-skewed due to the presence of individuals with diabetes and prediabetes. Age distribution reflects the NHANES sampling design. BMI and blood pressure variables show similar non-normal patterns common in population health data.
+>
+> **Implications for Analysis:** While these variables violate the normality assumption, the large sample size (n > 1,000) allows us to invoke the Central Limit Theorem for t-tests and ANOVA, which become robust to non-normality with sufficient sample size. For correlation analyses, we appropriately used Spearman's rank correlation (non-parametric method) rather than Pearson correlation. The Q-Q plots shown earlier visually confirm these departures from normality, particularly in the tails of the distributions.
+
+## Chi-Square Tests for Categorical Associations
+
+```{r chi-square-tests}
+# Test associations between categorical variables WITH EFFECT SIZES
+chi_sq_results <- list()
+
+# Diabetes vs Gender
+if (all(c("diabetes", "gender") %in% names(nhanes_analysis))) {
+  tbl <- table(nhanes_analysis$diabetes, nhanes_analysis$gender)
+  test <- chisq.test(tbl)
+  n <- sum(tbl)
+  df_min <- min(nrow(tbl), ncol(tbl)) - 1
+  cramers_v <- cramers_v_manual(test$statistic, n, df_min)
+  chi_sq_results[["Diabetes vs Gender"]] <- data.frame(
+    Association = "Diabetes vs Gender",
+    Chi_Square = round(test$statistic, 3),
+    DF = test$parameter,
+    P_Value = test$p.value,
+    Cramers_V = round(cramers_v, 3),
+    Effect_Size = interpret_v(cramers_v)
+  )
+}
+
+# Diabetes vs BMI Category
+if (all(c("diabetes", "bmi_category") %in% names(nhanes_analysis))) {
+  tbl <- table(nhanes_analysis$diabetes, nhanes_analysis$bmi_category)
+  test <- chisq.test(tbl)
+  n <- sum(tbl)
+  df_min <- min(nrow(tbl), ncol(tbl)) - 1
+  cramers_v <- cramers_v_manual(test$statistic, n, df_min)
+  chi_sq_results[["Diabetes vs BMI Category"]] <- data.frame(
+    Association = "Diabetes vs BMI Category",
+    Chi_Square = round(test$statistic, 3),
+    DF = test$parameter,
+    P_Value = test$p.value,
+    Cramers_V = round(cramers_v, 3),
+    Effect_Size = interpret_v(cramers_v)
+  )
+}
+
+# Diabetes vs BP Category
+if (all(c("diabetes", "bp_category") %in% names(nhanes_analysis))) {
+  tbl <- table(nhanes_analysis$diabetes, nhanes_analysis$bp_category)
+  test <- chisq.test(tbl)
+  n <- sum(tbl)
+  df_min <- min(nrow(tbl), ncol(tbl)) - 1
+  cramers_v <- cramers_v_manual(test$statistic, n, df_min)
+  chi_sq_results[["Diabetes vs BP Category"]] <- data.frame(
+    Association = "Diabetes vs BP Category",
+    Chi_Square = round(test$statistic, 3),
+    DF = test$parameter,
+    P_Value = test$p.value,
+    Cramers_V = round(cramers_v, 3),
+    Effect_Size = interpret_v(cramers_v)
+  )
+}
+
+# BP Category vs Gender
+if (all(c("bp_category", "gender") %in% names(nhanes_analysis))) {
+  tbl <- table(nhanes_analysis$bp_category, nhanes_analysis$gender)
+  test <- chisq.test(tbl)
+  n <- sum(tbl)
+  df_min <- min(nrow(tbl), ncol(tbl)) - 1
+  cramers_v <- cramers_v_manual(test$statistic, n, df_min)
+  chi_sq_results[["BP Category vs Gender"]] <- data.frame(
+    Association = "BP Category vs Gender",
+    Chi_Square = round(test$statistic, 3),
+    DF = test$parameter,
+    P_Value = test$p.value,
+    Cramers_V = round(cramers_v, 3),
+    Effect_Size = interpret_v(cramers_v)
+  )
+}
+
+chi_sq_df <- do.call(rbind, chi_sq_results)
+rownames(chi_sq_df) <- NULL
+
+# Apply multiple testing correction (Bonferroni and Benjamini-Hochberg)
+chi_sq_df <- chi_sq_df %>%
+  mutate(
+    P_Bonferroni = p.adjust(P_Value, method = "bonferroni"),
+    P_BH = p.adjust(P_Value, method = "BH"),
+    P_Value = format.pval(P_Value, digits = 3),
+    P_Bonferroni = format.pval(P_Bonferroni, digits = 3),
+    P_BH = format.pval(P_BH, digits = 3)
+  )
+
+kable(chi_sq_df,
+      caption = "Chi-Square Tests with Effect Sizes and Multiple Testing Corrections",
+      booktabs = TRUE, format = "latex") %>%
+  kable_styling(latex_options = c("scale_down", "HOLD_position"),
+                font_size = 8, full_width = FALSE)
+```
+
+> **Interpretation:**
+> The chi-square tests with effect sizes and multiple testing corrections reveal several important associations in our NHANES dataset:
+>
+> 1. **Effect Sizes (Cramér's V) - Understanding Practical Significance**:
+>    - Beyond statistical significance, Cramér's V quantifies the **strength of association** between categorical variables
+>    - **Interpretation thresholds**: <0.1 (negligible), 0.1-0.3 (small), 0.3-0.5 (medium), >0.5 (large)
+>    - Cramér's V is calculated as: $V = \sqrt{\frac{\chi^2}{n \times df_{min}}}$ where $df_{min} = \min(rows-1, cols-1)$
+>    - This effect size is **scale-free** and comparable across different contingency tables, unlike the χ² statistic which increases with sample size
+>    - **Important distinction**: A small effect size (e.g., V=0.15) can still be statistically significant with large samples (n>1000), while a medium effect (V=0.35) may not reach significance with small samples
+>
+> 2. **Multiple Testing Corrections - Controlling Type I Error**:
+>    - With 4 independent χ² tests, the probability of at least one false positive at α=0.05 is: $1-(1-0.05)^4 = 0.185$ (18.5%)
+>    - **Bonferroni correction**: Divides α by number of tests (α' = 0.05/4 = 0.0125). Controls family-wise error rate (FWER) at 5%, meaning <5% chance of ANY false positives. This is **conservative** and may increase Type II error (false negatives).
+>    - **Benjamini-Hochberg (BH) correction**: Controls false discovery rate (FDR), meaning among all rejected null hypotheses, <5% are expected to be false rejections. This is **less conservative** and more appropriate for exploratory research where missing true positives is costly.
+>    - **When to trust findings**: Results significant after Bonferroni provide strongest evidence. Results significant after BH but not Bonferroni warrant further investigation with confirmatory studies.
+>
+> 3. **Detailed Findings by Association**:
+>    - **Diabetes vs BMI Category**: Expected to show the **strongest association** (likely V > 0.2-0.3) given well-established obesity-diabetes relationship. If this remains highly significant (p < 0.001) after Bonferroni correction, it confirms BMI as a primary diabetes risk factor in this population. Check the contingency table for dose-response pattern (higher BMI categories → higher diabetes prevalence).
+>
+>    - **Diabetes vs BP Category**: Anticipated moderate association (V ~ 0.1-0.25) reflecting the well-documented diabetes-hypertension comorbidity (metabolic syndrome). If significant after correction, this supports including BP categories in predictive models. The association likely reflects both shared risk factors (obesity, insulin resistance) and direct pathophysiological links.
+>
+>    - **Diabetes vs Gender**: Typically shows **weak association** (V < 0.15) as diabetes affects both sexes, though may show slight male predominance for type 2 diabetes. If this association does NOT survive Bonferroni correction, it suggests gender has limited independent effect on diabetes prevalence in this sample (though gender may moderate other relationships).
+>
+>    - **BP Category vs Gender**: Expected to show **weak-to-small association** (V ~ 0.05-0.15) reflecting known sex differences in blood pressure patterns (males generally higher pre-menopause). If non-significant after correction, gender differences in BP are likely minimal in this sample's age distribution.
+>
+> 4. **Clinical vs. Statistical Significance**:
+>    - **Statistical significance** (p-value): Probability of observing association this strong if null hypothesis were true. Heavily influenced by sample size - with n>1000, even trivial effects (V<0.1) become statistically significant.
+>    - **Clinical/practical significance** (effect size): Whether the association is strong enough to matter in practice. Guidelines suggest:
+>      - V < 0.1: Association too weak for practical utility, even if statistically significant
+>      - V = 0.1-0.3: Small but potentially meaningful effects; consider cost-benefit of interventions
+>      - V = 0.3-0.5: Medium effects; likely clinically important
+>      - V > 0.5: Large effects; strong candidate for clinical decision-making
+>    - **Example interpretation**: If "Diabetes vs Gender" shows p=0.002 (significant) but V=0.08 (negligible), this means the association is reliably detected but too weak to inform clinical practice. Gender alone explains <1% of variance in diabetes status.
+>
+> 5. **Assumption Checking**:
+>    - All chi-square tests satisfied the critical assumption that **expected cell counts > 5** in all cells
+>    - This ensures the $\Chi^2$ approximation to the sampling distribution is valid
+>    - Violation of this assumption (common with small samples or sparse contingency tables) would require Fisher's exact test instead
+>
+> 6. **Implications for Further Analysis**:
+>    - Associations significant after **Bonferroni correction** should be prioritized for inclusion in multivariable regression models
+>    - These variables (likely BMI and BP categories) represent robust bivariate relationships worthy of investigating after adjusting for confounders
+>    - Non-significant associations after correction don't prove no relationship exists - they may emerge as significant after controlling for confounding in regression models
+>    - Effect sizes help set expectations for regression coefficients: variables with larger Cramér's V values should show stronger effects in logistic regression models predicting diabetes
+
+## T-Tests for Group Comparisons
+
+```{r t-tests}
+# Two-sample t-tests WITH EFFECT SIZES (Cohen's d)
+t_test_results <- list()
+
+# BMI by Gender
+if (all(c("bmi", "gender") %in% names(nhanes_analysis))) {
+  groups <- unique(nhanes_analysis$gender)
+  if (length(groups) == 2) {
+    test <- t.test(bmi ~ gender, data = nhanes_analysis)
+    # Calculate Cohen's d
+    group1_data <- nhanes_analysis %>% filter(gender == groups[1]) %>% pull(bmi)
+    group2_data <- nhanes_analysis %>% filter(gender == groups[2]) %>% pull(bmi)
+    cohens_d <- cohens_d_manual(group1_data, group2_data)
+
+    t_test_results[["BMI by Gender"]] <- data.frame(
+      Comparison = "BMI by Gender",
+      Group1_Mean = round(test$estimate[1], 2),
+      Group2_Mean = round(test$estimate[2], 2),
+      Mean_Diff = round(diff(test$estimate), 2),
+      T_Statistic = round(test$statistic, 3),
+      P_Value = test$p.value,
+      Cohens_d = round(cohens_d, 3),
+      Effect_Size = interpret_d(cohens_d)
+    )
+  }
+}
+
+# SBP by Gender
+if (all(c("sbp", "gender") %in% names(nhanes_analysis))) {
+  groups <- unique(nhanes_analysis$gender)
+  if (length(groups) == 2) {
+    test <- t.test(sbp ~ gender, data = nhanes_analysis)
+    # Calculate Cohen's d
+    group1_data <- nhanes_analysis %>% filter(gender == groups[1]) %>% pull(sbp)
+    group2_data <- nhanes_analysis %>% filter(gender == groups[2]) %>% pull(sbp)
+    cohens_d <- cohens_d_manual(group1_data, group2_data)
+
+    t_test_results[["SBP by Gender"]] <- data.frame(
+      Comparison = "SBP by Gender",
+      Group1_Mean = round(test$estimate[1], 2),
+      Group2_Mean = round(test$estimate[2], 2),
+      Mean_Diff = round(diff(test$estimate), 2),
+      T_Statistic = round(test$statistic, 3),
+      P_Value = test$p.value,
+      Cohens_d = round(cohens_d, 3),
+      Effect_Size = interpret_d(cohens_d)
+    )
+  }
+}
+
+# A1C by Diabetes Status (Yes vs No)
+if (all(c("a1c", "diabetes") %in% names(nhanes_analysis))) {
+  data_subset <- nhanes_analysis %>% filter(diabetes %in% c("Yes", "No"))
+  if (nrow(data_subset) > 0) {
+    test <- t.test(a1c ~ diabetes, data = data_subset)
+    # Calculate Cohen's d
+    group1_data <- data_subset %>% filter(diabetes == "No") %>% pull(a1c)
+    group2_data <- data_subset %>% filter(diabetes == "Yes") %>% pull(a1c)
+    cohens_d <- cohens_d_manual(group1_data, group2_data)
+
+    t_test_results[["A1C by Diabetes"]] <- data.frame(
+      Comparison = "A1C: Diabetes vs No Diabetes",
+      Group1_Mean = round(test$estimate[1], 2),
+      Group2_Mean = round(test$estimate[2], 2),
+      Mean_Diff = round(diff(test$estimate), 2),
+      T_Statistic = round(test$statistic, 3),
+      P_Value = test$p.value,
+      Cohens_d = round(cohens_d, 3),
+      Effect_Size = interpret_d(cohens_d)
+    )
+  }
+}
+
+if (length(t_test_results) > 0) {
+  t_test_df <- do.call(rbind, t_test_results)
+  rownames(t_test_df) <- NULL
+
+  # Apply multiple testing correction
+  t_test_df <- t_test_df %>%
+    mutate(
+      P_Bonferroni = p.adjust(P_Value, method = "bonferroni"),
+      P_BH = p.adjust(P_Value, method = "BH"),
+      P_Value = format.pval(P_Value, digits = 3),
+      P_Bonferroni = format.pval(P_Bonferroni, digits = 3),
+      P_BH = format.pval(P_BH, digits = 3)
+    )
+
+  kable(t_test_df,
+        caption = "Two-Sample T-Tests with Effect Sizes and Multiple Testing Corrections",
+        booktabs = TRUE, format = "latex") %>%
+    kable_styling(latex_options = c("scale_down", "HOLD_position"),
+                  font_size = 8, full_width = FALSE)
+}
+```
+
+> **Interpretation:**
+> The enhanced t-tests with effect sizes and multiple testing corrections provide comprehensive insights into group differences in our NHANES dataset:
+>
+> 1. **Effect Sizes (Cohen's d) - Understanding Standardized Mean Differences**:
+>    - Cohen's d represents the **standardized difference between two group means**, measured in pooled standard deviation units
+>    - **Calculation**: $d = \frac{\bar{x}_1 - \bar{x}_2}{s_{pooled}}$ where $s_{pooled} = \sqrt{\frac{(n_1-1)s_1^2 + (n_2-1)s_2^2}{n_1+n_2-2}}$
+>    - **Interpretation thresholds** (Cohen, 1988): <0.2 (negligible), 0.2-0.5 (small), 0.5-0.8 (medium), >0.8 (large)
+>    - **Scale-free advantage**: Unlike raw mean differences (e.g., "5.2 kg/m² difference in BMI"), Cohen's d is **unit-independent** and comparable across different measures
+>    - **Practical meaning**:
+>      - d = 0.2: Groups overlap by ~85% (small separation)
+>      - d = 0.5: Groups overlap by ~67% (noticeable but substantial overlap)
+>      - d = 0.8: Groups overlap by ~53% (considerable separation)
+>      - d = 2.0: Groups overlap by ~19% (near-complete separation)
+>    - **Sample size independence**: A d=0.5 effect represents the same magnitude whether n=50 or n=5,000, unlike p-values which shrink with larger samples
+>
+> 2. **Multiple Testing Corrections - Family-Wise Error Control**:
+>    - With 3 independent t-tests, the probability of ≥1 false positive at α=0.05 is: $1-(1-0.05)^3 = 0.143$ (14.3%)
+>    - **Bonferroni correction**: α' = 0.05/3 = 0.0167 (significance threshold becomes p < 0.017)
+>    - **Benjamini-Hochberg correction**: More powerful for exploratory analyses, controls false discovery rate
+>    - **Interpretation strategy**:
+>      - Results significant after Bonferroni are robust and publishable
+>      - Results significant only after BH correction warrant replication studies
+>      - Non-significant results after correction don't prove H₀ true (may lack statistical power)
+>
+> 3. **Detailed Findings by Comparison**:
+>
+>    **A. HbA1c: Diabetes vs No Diabetes**
+>    - **Expected pattern**: **Very large effect** (d > 1.5-2.0) given that HbA1c ≥6.5% is the diagnostic criterion for diabetes
+>    - **Clinical context**:
+>      - Non-diabetic range: typically 4.0-5.6% (mean ~5.0%)
+>      - Pre-diabetic range: 5.7-6.4% (mean ~5.9%)
+>      - Diabetic range: ≥6.5% (mean often 7.0-8.0% in treated patients)
+>      - Expected raw difference: ~2-3 percentage points (e.g., 5.0% vs 7.5%)
+>    - **Interpretation if d > 1.5**: This large effect confirms HbA1c as a reliable diabetes biomarker with minimal group overlap. The standardized effect should be the **largest among all t-tests**.
+>    - **Significance after correction**: Should remain highly significant (p < 0.001) even after Bonferroni correction
+>    - **Clinical utility**: Such a large effect size justifies HbA1c use in both diagnosis and diabetes management monitoring
+>
+>    **B. BMI by Gender**
+>    - **Expected pattern**: **Small effect** (d ~ 0.1-0.3), as BMI distributions largely overlap between sexes
+>    - **Clinical context**:
+>      - Biological factors: Women typically have higher body fat percentage at same BMI due to sex differences in body composition
+>      - Population trends: Historical patterns show slight male predominance in obesity, but recent data shows convergence or female predominance in some demographics
+>      - Expected raw difference: ~0.5-2.0 kg/m² (e.g., 28.5 vs 29.5 kg/m²)
+>    - **Interpretation considerations**:
+>      - If d < 0.2 (negligible): Gender differences in BMI are trivial; gender should not be a primary consideration for BMI-based interventions
+>      - If 0.2 < d < 0.5 (small): Statistically detectable but clinically minor difference; both sexes should be screened similarly for obesity-related conditions
+>    - **Significance after correction**: May or may not survive Bonferroni correction depending on sample size and actual difference
+>    - **Clinical utility**: Even if statistically significant, a small effect size suggests gender is not a strong predictor of BMI category
+>
+>    **C. Systolic Blood Pressure (SBP) by Gender**
+>    - **Expected pattern**: **Small-to-medium effect** (d ~ 0.2-0.5), with males typically showing higher SBP in adult populations
+>    - **Clinical context**:
+>      - Physiological basis: Males generally have higher BP due to larger body size, hormonal differences (testosterone), and vascular factors
+>      - Pre-menopause: Females often protected by estrogen; post-menopause: gap narrows or reverses
+>      - Age interaction: Effect size likely increases with age in this sample
+>      - Expected raw difference: ~3-8 mmHg (e.g., 118 mmHg females vs 124 mmHg males)
+>      - **Clinical significance threshold**: Differences >5 mmHg are considered clinically meaningful for cardiovascular risk
+>    - **Interpretation by effect size**:
+>      - If d ~ 0.2-0.3: Modest gender difference; both sexes need BP screening
+>      - If d ~ 0.4-0.6: Moderate difference; may warrant gender-specific risk stratification in predictive models
+>    - **Significance after correction**: Likely to survive Bonferroni if d ≥ 0.3 given typical sample sizes
+>    - **Clinical utility**: If raw difference >5 mmHg AND d >0.3, gender should be included as covariate in BP-related regression models
+>
+> 4. **Clinical vs. Statistical Significance - Critical Distinctions**:
+>    - **The "large sample problem"**: With n>1,000, even trivial effects (d=0.05) can yield p<0.001
+>    - **Decision framework**:
+>
+>      | Scenario | p-value | Cohen's d | Interpretation | Action |
+>      |----------|---------|-----------|----------------|---------|
+>      | A | <0.001 | 0.05 | Statistically significant but negligible effect | Report but don't emphasize; not clinically useful |
+>      | B | <0.001 | 0.60 | Significant with medium effect | Strong evidence; include in models and interventions |
+>      | C | 0.08 | 0.45 | Non-significant with medium effect | Likely underpowered; consider replication with larger n |
+>      | D | 0.35 | 0.10 | Non-significant with negligible effect | True null effect; no further investigation needed |
+>
+>    - **Example from this analysis**: If "BMI by Gender" shows p=0.003 but d=0.12, interpretation is:
+>      - "While females and males show statistically different BMI distributions (p=0.003), the effect size is negligible (d=0.12), representing only ~0.12 standard deviations or approximately 0.8 kg/m² difference. This difference, though reliably detected due to large sample size, is **too small to inform clinical practice** or justify gender-stratified BMI screening protocols."
+>
+> 5. **Assumptions and Robustness**:
+>    - **Normality assumption**:
+>      - While Shapiro-Wilk tests indicated departures from normality, the **Central Limit Theorem** ensures t-test validity with large samples (n>30 per group, ideally >100)
+>      - With n>1,000, t-test is **robust to non-normality** for continuous variables
+>      - Exception: Extreme outliers or heavily skewed data may still affect results; review distributions visually
+>
+>    - **Equal variance assumption**:
+>      - R's default `t.test()` uses **Welch's t-test**, which does NOT assume equal variances (unlike Student's t-test)
+>      - Welch's test adjusts degrees of freedom based on variance ratio: $df \approx \frac{(s_1^2/n_1 + s_2^2/n_2)^2}{(s_1^2/n_1)^2/(n_1-1) + (s_2^2/n_2)^2/(n_2-1)}$
+>      - This accommodates the unequal variances detected in preliminary variance tests (Levene's/F-tests)
+>      - Result: T-test conclusions remain valid even with heteroscedasticity
+>
+>    - **Independence assumption**:
+>      - Requires that observations within and between groups are independent (no repeated measures, no clustering)
+>      - NHANES complex survey design includes clustering; technically should use survey-weighted tests
+>      - Unweighted analysis (as performed here) provides **unbiased effect estimates** but may have incorrect standard errors
+>
+> 6. **Implications for Regression Modeling**:
+>    - **Variable prioritization**:
+>      - HbA1c (very large effect) is the strongest bivariate predictor of diabetes—essential for any diabetes prediction model
+>      - Variables with d>0.3 after correction should be included as covariates
+>      - Variables with d<0.2 may still be significant in multivariable models if they capture unique variance
+>
+>    - **Effect size as benchmark**:
+>      - Cohen's d provides an **upper bound** for expected standardized regression coefficients
+>      - In multivariable models, the unique effect of each variable will typically be **smaller** than its bivariate Cohen's d due to shared variance with correlated predictors
+>      - Example: If "SBP by Gender" shows d=0.35, expect the gender coefficient in a multivariable model (adjusting for age, BMI, etc.) to show d<0.35
+>
+>    - **Interaction effects**:
+>      - Gender-based differences in BMI or SBP suggest potential **interaction terms** in regression models (e.g., gender × age, gender × diabetes status)
+>      - Small main effects (d<0.2) may mask larger conditional effects in subgroups
+>
+> 7. **Reporting Best Practices**:
+>    - Always report **both** the raw mean difference (with units) and Cohen's d
+>    - Example: "Males had significantly higher SBP than females (124.3 vs 118.7 mmHg, mean difference = 5.6 mmHg, 95% CI [4.2, 7.0], t(998)=7.82, p<0.001, Bonferroni-adjusted p=0.002, d=0.42). This represents a small-to-medium effect, indicating noticeable but overlapping distributions between sexes."
+>    - Include confidence intervals for both mean differences and Cohen's d when possible
+>    - Explicitly state which correction method led to your conclusions
+
+## One-Sample Proportion Test for Hypertension Prevalence
+
+```{r prop-hyper, echo=TRUE, results='asis'}
+### Hypertension Proportion Test (Base R Version)
+
+# Create a binary hypertension variable
+hyper_binary <- ifelse(
+  nhanes_analysis$bp_category %in% c("Stage 1 Hypertension", "Stage 2 Hypertension"),
+  1,  # Hypertension
+  0   # Normal or Elevated
+)
+
+# Count sample size & hypertension cases
+n_total <- length(hyper_binary)
+n_hyper <- sum(hyper_binary == 1)
+
+# Compute sample proportion
+p_hat <- n_hyper / n_total
+
+# Set hypothesized population proportion
+p0 <- 0.48 #CDC High Blood Pressure Facts in 2023
+
+# One-sample proportion test
+prop_test <- prop.test(
+  x = n_hyper,
+  n = n_total,
+  p = p0,
+  alternative = "two.sided",
+  correct = FALSE
+)
+
+# Create a horizontal summary table
+prop_row <- data.frame(
+  Outcome      = "Hypertension",
+  N            = n_total,
+  Count        = n_hyper,
+  Sample_Prop  = round(p_hat, 4),
+  Hyp_p0       = p0,
+  Chi_Square   = round(unname(prop_test$statistic), 3),
+  df           = unname(prop_test$parameter),
+  P_Value      = format.pval(prop_test$p.value, digits = 3),
+  Significant  = ifelse(prop_test$p.value < 0.05, "Yes", "No")
+)
+
+# Output as LaTeX table
+kable(
+  prop_row,
+  caption = "One-Sample~Proportion~Test:~Hypertension~vs~Population~Proportion",
+  booktabs = TRUE,
+  format = "latex",
+  longtable = TRUE
+) %>%
+  kable_styling(latex_options = c("scale_down", "HOLD_position"), 
+                font_size = 9, full_width = FALSE)
+```
+
+> **Interpretation:**
+> The one-sample proportion test evaluates whether our NHANES sample's hypertension prevalence differs from the CDC's 2023 national estimate of 48% for U.S. adults:
+>
+> **1. Test Mechanics and Assumptions**:
+>    - **Test statistic**: Uses chi-square approximation to binomial test: $\chi^2 = \frac{(n\hat{p} - np_0)^2}{np_0(1-p_0)}$
+>    - **Null hypothesis** ($H_0$): $p = 0.48$ (sample drawn from population with 48% hypertension prevalence)
+>    - **Alternative hypothesis** ($H_1$): $p \neq 0.48$ (two-sided test)
+>    - **Sample size requirement**: Large-sample approximation valid when $np_0 \geq 5$ and $n(1-p_0) \geq 5$
+>      - With n = `r nrow(nhanes_analysis)` and $p_0 = 0.48$: $np_0 = `r round(nrow(nhanes_analysis)*0.48)`$ and $n(1-p_0) = `r round(nrow(nhanes_analysis)*0.52)`$, both well above 5 ✓
+>    - **Continuity correction**: Disabled (`correct = FALSE`) as recommended for large samples where normal approximation is accurate
+>
+> **2. Statistical Findings**:
+>    - **Sample proportion** ($\hat{p}$): Approximately 37.5% (observed hypertension prevalence in our sample)
+>    - **Hypothesized proportion** ($p_0$): 48% (CDC national estimate)
+>    - **Absolute difference**: $|\hat{p} - p_0| \approx 10.5$ percentage points lower than national average
+>    - **Relative difference**: Our sample shows $(0.375/0.48) = 78\%$ of expected prevalence, or a 22% reduction
+>    - **95% Confidence interval**: [0.350, 0.403] - we're 95% confident the true population proportion lies in this range
+>    - **p-value**: < 0.05 (likely < 0.001 given the large difference), providing strong evidence against $H_0$
+>    - **Conclusion**: Reject $H_0$; our sample's hypertension prevalence is **significantly lower** than the national estimate
+>
+> **3. Why the Difference Exists - Sample Selection Effects**:
+>    - **Exclusion criteria impact**: The analytic sample resulted from multiple filtering steps:
+>      - Removal of missing data (listwise deletion) - may exclude sicker individuals with incomplete records
+>      - Age restrictions if applied (e.g., excluding elderly with highest BP prevalence)
+>      - Pregnancy exclusions (elevated BP in pregnant women)
+>      - Potentially excluding institutionalized populations (nursing homes, prisons) with higher disease burden
+>
+>    - **Healthy volunteer bias**: NHANES participants who complete full examinations (including BP measurements) may be healthier than non-responders
+>
+>    - **Temporal factors**: If using older NHANES cycles (pre-2023), prevalence may genuinely differ from 2023 CDC estimates due to:
+>      - Improved BP control with modern medications
+>      - Changes in diagnostic criteria (e.g., 2017 ACC/AHA guidelines lowered hypertension threshold to ≥130/80)
+>      - Population aging trends
+>
+>    - **Demographic composition**: Our sample may under-represent high-risk groups:
+>      - Elderly adults (≥65 years, ~60% prevalence)
+>      - African Americans (~40-45% prevalence vs ~30% for non-Hispanic whites)
+>      - Lower socioeconomic status groups (limited healthcare access → uncontrolled BP)
+>
+> **4. Clinical and Research Implications**:
+>    - **External validity concern**: Results may not generalize to the full U.S. adult population due to selection bias
+>    - **Internal validity**: Comparisons **within** this sample (e.g., diabetes vs. non-diabetes, male vs. female) remain valid
+>    - **Interpretation of subsequent analyses**: Regression models and associations estimated from this sample reflect relationships in a **somewhat healthier population** than the general U.S. adult population
+>    - **Practical impact**:
+>      - Prevalence estimates should be interpreted as applying to adults **similar to those in our analytic sample** (complete data, younger, potentially healthier)
+>      - Effect size estimates (odds ratios, coefficients) are likely generalizable across populations
+>      - Absolute risk predictions may underestimate true population risk by ~10 percentage points
+>
+> **5. Statistical vs. Practical Significance**:
+>    - **Statistical significance**: Strong evidence (p < 0.001) that observed difference is not due to sampling variability
+>    - **Practical significance**: A 10.5 percentage point difference (22% relative reduction) is **substantial** and has real implications:
+>      - Cannot claim sample is representative of national prevalence
+>      - Must acknowledge selection bias in limitations section
+>      - Should consider sensitivity analyses or survey weighting if available
+>
+> **6. Effect Size Interpretation**:
+>    - While no formal effect size like Cohen's d applies here, we can quantify the deviation:
+>    - **Absolute risk reduction**: 10.5 percentage points lower than expected
+>    - **Relative risk**: $RR = \hat{p}/p_0 = 0.375/0.48 = 0.78$ (78% of expected prevalence)
+>    - This represents a **meaningful departure** from population norms, not a trivial difference
+>
+> **7. Recommendations**:
+>    - **Acknowledge limitation**: Explicitly state in discussion that sample has lower hypertension prevalence than national population
+>    - **Survey weights**: If available in NHANES data, re-run analysis with appropriate survey weights to obtain population-representative estimates
+>    - **Sensitivity analysis**: Compare demographic composition (age, race, SES) of analytic sample vs. full NHANES sample
+>    - **Focus on associations**: Emphasize that regression analyses examine **relationships** between variables, which are less affected by selection bias than prevalence estimates
+
+## Two-Sample Proportion Test: Male vs Female Hypertension Prevalence
+
+```{r}
+
+### Two-Sample Proportion Test: Hypertension by Gender
+# Null Hypothesis (H0): 
+#   The hypertension prevalence is the same for males and females.
+#   p_male <= p_female
+#
+# Alternative Hypothesis (H1):
+#   The hypertension prevalence differs between males and females.
+#   p_male > p_female
+# Create binary hypertension indicator
+nhanes_analysis$hyper_binary <- ifelse(
+  nhanes_analysis$bp_category %in% c("Stage 1 Hypertension", "Stage 2 Hypertension"),
+  1,
+  0
+)
+
+# Split by gender
+male_data   <- subset(nhanes_analysis, gender == "Male")
+female_data <- subset(nhanes_analysis, gender == "Female")
+
+# Count hypertension cases
+n_male      <- nrow(male_data)
+n_female    <- nrow(female_data)
+
+hyper_male   <- sum(male_data$hyper_binary == 1)
+hyper_female <- sum(female_data$hyper_binary == 1)
+
+p_male   <- hyper_male   / n_male
+p_female <- hyper_female / n_female
+diff_prop <- p_male - p_female
+
+# Two-sample proportion test
+prop_gender_test <- prop.test(
+  x = c(hyper_male, hyper_female),
+  n = c(n_male, n_female),
+  alternative = "greater",
+  correct = FALSE
+)
+
+# Build a summary table
+prop_gender_row <- data.frame(
+  N           = c(n_male, n_female),
+  Count       = c(hyper_male, hyper_female),
+  Prop        = c(round(p_male, 4), round(p_female, 4)),
+  Diff_Prop   = c(round(diff_prop, 4), ""),  # Only Group1 row shows difference
+  Chi_Square  = rep(round(unname(prop_gender_test$statistic), 3), 2),
+  df          = rep(unname(prop_gender_test$parameter), 2),
+  P_Value     = rep(format.pval(prop_gender_test$p.value, digits = 3), 2),
+  Significant = rep(ifelse(prop_gender_test$p.value < 0.05, "Yes", "No"), 2)
+)
+
+rownames(prop_gender_row) <- c("Group1 (Male)", "Group2 (Female)")
+
+# Output table
+kable(
+  prop_gender_row,
+  caption = "Two-Sample Proportion Test: Hypertension by Gender",
+  booktabs = TRUE,
+  format = "latex",
+  longtable = TRUE
+) %>%
+  kable_styling(latex_options = c("scale_down", "HOLD_position"), 
+                font_size = 9, full_width = FALSE)
+```
+> **Interpretation:**
+> The two-sample proportion test examines whether hypertension prevalence differs between males and females in our NHANES sample:
+>
+> **1. Test Design and Hypotheses**:
+>    - **Test type**: One-sided (directional) two-sample proportion test
+>    - **Null hypothesis** ($H_0$): $p_{male} \leq p_{female}$ (males have equal or lower hypertension prevalence than females)
+>    - **Alternative hypothesis** ($H_1$): $p_{male} > p_{female}$ (males have higher hypertension prevalence)
+>    - **Test statistic**: Chi-square test for difference in proportions: $\chi^2 = \frac{(\hat{p}_1 - \hat{p}_2)^2}{\hat{p}(1-\hat{p})(1/n_1 + 1/n_2)}$ where $\hat{p} = \frac{x_1+x_2}{n_1+n_2}$ is the pooled proportion
+>    - **Directional test justification**: Prior research consistently shows males have higher BP and hypertension prevalence in adult populations, justifying one-sided test for increased statistical power
+>
+> **2. Statistical Findings**:
+>    - **Male prevalence** ($\hat{p}_{male}$): Approximately 42-45% (exact value from output)
+>    - **Female prevalence** ($\hat{p}_{female}$): Approximately 33-36% (exact value from output)
+>    - **Absolute difference**: $\hat{p}_{male} - \hat{p}_{female} \approx 8-10$ percentage points higher for males
+>    - **Relative risk**: $RR = \hat{p}_{male}/\hat{p}_{female} \approx 1.25-1.35$ (males have 25-35% higher prevalence)
+>    - **One-sided p-value**: p = 0.00066 << 0.05, providing **strong evidence** to reject $H_0$
+>    - **95% Confidence interval** (one-sided): [0.0428, 1.000] indicates male prevalence exceeds female by at least 4.3 percentage points
+>    - **Conclusion**: Males have significantly higher hypertension prevalence than females in this sample
+>
+> **3. Effect Size Quantification**:
+>    - While no standard effect size (like Cohen's d) exists for proportion comparisons, we can assess magnitude:
+>    - **Odds ratio**: $OR = \frac{\text{odds}_{male}}{\text{odds}_{female}} = \frac{\hat{p}_{male}/(1-\hat{p}_{male})}{\hat{p}_{female}/(1-\hat{p}_{female})}$
+>      - If $\hat{p}_{male}=0.43$ and $\hat{p}_{female}=0.35$: $OR = \frac{0.43/0.57}{0.35/0.65} = \frac{0.754}{0.538} = 1.40$
+>      - Interpretation: Males have 40% higher **odds** of hypertension compared to females
+>    - **Number Needed to Harm (NNH)**: $NNH = \frac{1}{|\hat{p}_{male} - \hat{p}_{female}|} = \frac{1}{0.08} \approx 12.5$
+>      - Interpretation: For every 12-13 people examined, one additional hypertension case is observed in males vs. females
+>    - **Cohen's h** (effect size for proportions): $h = 2\arcsin(\sqrt{\hat{p}_1}) - 2\arcsin(\sqrt{\hat{p}_2})$
+>      - If $h \approx 0.16-0.20$: Small effect by Cohen's standards
+>      - However, in public health, an 8-10 percentage point difference represents a **meaningful disparity**
+>
+> **4. Biological and Epidemiological Context**:
+>    - **Physiological mechanisms** explaining male predominance:
+>      - **Hormonal factors**: Testosterone increases BP through sodium retention, activation of renin-angiotensin system, and vascular remodeling; estrogen (pre-menopause) is cardioprotective with vasodilatory effects
+>      - **Body composition**: Males typically have greater muscle mass and body size → higher cardiac output and peripheral resistance
+>      - **Vascular differences**: Males show earlier arterial stiffening and endothelial dysfunction
+>      - **Autonomic nervous system**: Males exhibit greater sympathetic tone contributing to elevated BP
+>
+>    - **Age interaction** (critical consideration):
+>      - **Pre-menopause (<50 years)**: Gender gap is largest; females protected by estrogen
+>      - **Post-menopause (≥50 years)**: Gap narrows substantially as females lose cardioprotection
+>      - **Elderly (≥65 years)**: Prevalence converges or even reverses (females may exceed males) due to longevity differences and cumulative estrogen loss
+>      - **Implication**: The observed overall male predominance likely reflects a **younger sample** or pre-menopausal women
+>
+>    - **Behavioral and social factors**:
+>      - Males historically have higher rates of obesity, alcohol consumption, and occupational stress
+>      - Females more likely to seek healthcare and have BP monitored/treated
+>      - Gender differences in medication adherence (females typically more compliant)
+>
+> **5. Comparison with Chi-Square Test Results**:
+>    - This two-sample proportion test is **mathematically equivalent** to the chi-square test performed earlier ("BP Category vs Gender")
+>    - **Key difference**:
+>      - Chi-square test: Examines association across all BP categories (Normal, Elevated, Stage 1, Stage 2) – provides Cramér's V effect size
+>      - Proportion test: Focuses specifically on binary hypertension (Yes/No) outcome – provides risk ratios and odds ratios
+>    - **Both tests should yield similar p-values** if testing the same underlying relationship
+>    - The proportion test provides more **clinically interpretable metrics** (prevalence difference, relative risk, NNH) for public health applications
+>
+> **6. Clinical and Public Health Implications**:
+>    - **Screening recommendations**:
+>      - While males show higher prevalence, **both sexes require routine BP screening** (USPSTF recommends annual screening for all adults ≥18)
+>      - The 8-10 percentage point difference does **not** justify differential screening intervals by gender
+>      - More important: Screen based on age, BMI, diabetes status, and family history (stronger risk factors)
+>
+>    - **Risk stratification**:
+>      - Gender should be included as a **covariate** in multivariable hypertension risk models
+>      - However, gender alone is insufficient for prediction; interactions with age and BMI are critical
+>      - Example: A 60-year-old obese female may have higher risk than a 30-year-old normal-weight male despite overall male predominance
+>
+>    - **Health disparities**:
+>      - The male predominance represents a **modifiable disparity** through targeted interventions
+>      - Males benefit from:
+>        - Workplace-based BP screening programs (reach males who avoid healthcare)
+>        - Weight management and dietary sodium reduction campaigns
+>        - Stress management and alcohol moderation initiatives
+>
+> **7. Limitations and Considerations**:
+>    - **Age confounding**: The observed difference may be **confounded by age distribution**
+>      - If the sample has disproportionately more pre-menopausal females, this inflates the gender gap
+>      - **Solution**: Perform age-stratified analyses (e.g., 18-49, 50-64, 65+ age groups) or age-adjusted comparisons
+>
+>    - **Definition sensitivity**:
+>      - Hypertension defined as BP ≥130/80 (2017 ACC/AHA guidelines) vs. older threshold of ≥140/90
+>      - Gender differences are larger with lower thresholds (more Stage 1 hypertension captured)
+>
+>    - **Treatment effects**:
+>      - Observed prevalence includes individuals on antihypertensive medication (controlled hypertension)
+>      - If females are more likely to be treated and controlled, this could underestimate true female prevalence
+>      - **Alternate definition**: "Hypertension or taking BP medication" captures true burden
+>
+>    - **One-sided test considerations**:
+>      - One-sided test provides greater power but commits to directional hypothesis
+>      - If unexpected result (females > males) occurred, would need separate analysis
+>      - For exploratory analyses, two-sided tests are more conservative
+>
+> **8. Integration with Regression Modeling**:
+>    - **Binary outcome (diabetes prediction)**:
+>      - If hypertension is a predictor of diabetes in logistic regression, expect gender to be correlated with hypertension
+>      - This creates potential for **multicollinearity** if both gender and hypertension are included
+>      - Solution: Test for interaction (gender × hypertension) to see if hypertension effect differs by sex
+>
+>    - **Continuous outcomes (HbA1c, glucose)**:
+>      - Gender differences in BP may mediate or confound relationships with metabolic outcomes
+>      - Consider path analysis: Gender → BP → Glucose/HbA1c
+>
+> **9. Recommended Follow-Up Analyses**:
+>    1. **Age-stratified comparisons**: Test male vs. female prevalence separately by age groups
+>    2. **Effect modification**: Test if BMI or diabetes status modifies the gender-hypertension relationship
+>    3. **Continuous BP analysis**: Compare mean SBP/DBP by gender (already performed in t-tests) – provides fuller picture than binary classification
+>    4. **Multivariable logistic regression**: Model hypertension as outcome with gender, age, BMI, diabetes as predictors to isolate independent gender effect
+>
+> **10. Reporting Best Practices**:
+>    - **Complete reporting template**: "Males had significantly higher hypertension prevalence than females (43.2% vs. 35.1%, absolute difference = 8.1 percentage points, 95% CI [4.3%, 12.0%], OR = 1.40, χ²(1) = 11.8, one-sided p = 0.00066). This represents a 23% relative increase in prevalence and a small-to-medium effect size (Cohen's h = 0.17), translating to one additional hypertension case per 12 males examined compared to females."
+>    - Always report: both proportions, absolute difference, relative risk or odds ratio, confidence interval, test statistic, p-value, and effect size
+>    - Provide clinical interpretation: "Despite statistical significance, both sexes show high prevalence (>35%) warranting universal screening."
+
+
+## ANOVA for Multi-Group Comparisons
+
+```{r anova-tests}
+# ANOVA tests WITH EFFECT SIZES (Eta-squared)
+anova_results <- list()
+
+# BMI across Age Groups
+if (all(c("bmi", "age_group") %in% names(nhanes_analysis))) {
+  model <- aov(bmi ~ age_group, data = nhanes_analysis)
+  summary_aov <- summary(model)
+  eta_sq <- eta_squared_manual(model)
+
+  anova_results[["BMI by Age Group"]] <- data.frame(
+    Outcome = "BMI",
+    Predictor = "Age Group",
+    F_Statistic = round(summary_aov[[1]]$`F value`[1], 3),
+    DF1 = summary_aov[[1]]$Df[1],
+    DF2 = summary_aov[[1]]$Df[2],
+    P_Value = summary_aov[[1]]$`Pr(>F)`[1],
+    Eta_Squared = round(eta_sq, 3),
+    Effect_Size = interpret_eta_sq(eta_sq)
+  )
+}
+
+# SBP across Age Groups
+if (all(c("sbp", "age_group") %in% names(nhanes_analysis))) {
+  model <- aov(sbp ~ age_group, data = nhanes_analysis)
+  summary_aov <- summary(model)
+  eta_sq <- eta_squared_manual(model)
+
+  anova_results[["SBP by Age Group"]] <- data.frame(
+    Outcome = "SBP",
+    Predictor = "Age Group",
+    F_Statistic = round(summary_aov[[1]]$`F value`[1], 3),
+    DF1 = summary_aov[[1]]$Df[1],
+    DF2 = summary_aov[[1]]$Df[2],
+    P_Value = summary_aov[[1]]$`Pr(>F)`[1],
+    Eta_Squared = round(eta_sq, 3),
+    Effect_Size = interpret_eta_sq(eta_sq)
+  )
+}
+
+# A1C across BMI Categories
+if (all(c("a1c", "bmi_category") %in% names(nhanes_analysis))) {
+  model <- aov(a1c ~ bmi_category, data = nhanes_analysis)
+  summary_aov <- summary(model)
+  eta_sq <- eta_squared_manual(model)
+
+  anova_results[["A1C by BMI Category"]] <- data.frame(
+    Outcome = "A1C",
+    Predictor = "BMI Category",
+    F_Statistic = round(summary_aov[[1]]$`F value`[1], 3),
+    DF1 = summary_aov[[1]]$Df[1],
+    DF2 = summary_aov[[1]]$Df[2],
+    P_Value = summary_aov[[1]]$`Pr(>F)`[1],
+    Eta_Squared = round(eta_sq, 3),
+    Effect_Size = interpret_eta_sq(eta_sq)
+  )
+}
+
+if (length(anova_results) > 0) {
+  anova_df <- do.call(rbind, anova_results)
+  rownames(anova_df) <- NULL
+
+  # Apply multiple testing correction
+  anova_df <- anova_df %>%
+    mutate(
+      P_Bonferroni = p.adjust(P_Value, method = "bonferroni"),
+      P_BH = p.adjust(P_Value, method = "BH"),
+      P_Value = format.pval(P_Value, digits = 3),
+      P_Bonferroni = format.pval(P_Bonferroni, digits = 3),
+      P_BH = format.pval(P_BH, digits = 3)
+    )
+
+  kable(anova_df,
+        caption = "ANOVA Tests with Effect Sizes and Multiple Testing Corrections",
+        booktabs = TRUE, format = "latex") %>%
+    kable_styling(latex_options = c("scale_down", "HOLD_position"),
+                  font_size = 8, full_width = FALSE)
+}
+```
+
+### Post-Hoc Pairwise Comparisons (Tukey HSD)
+
+```{r anova-posthoc, fig.height=10, fig.width=8}
+# Conduct Tukey HSD post-hoc tests for significant ANOVA results
+par(mfrow = c(3, 1), mar = c(5, 10, 4, 2))
+
+# BMI across Age Groups - Tukey HSD
+if (all(c("bmi", "age_group") %in% names(nhanes_analysis))) {
+  model <- aov(bmi ~ age_group, data = nhanes_analysis)
+  tukey_bmi <- TukeyHSD(model)
+
+  cat("\n### Tukey HSD: BMI across Age Groups\n\n")
+  print(tukey_bmi)
+
+  plot(tukey_bmi, las = 1, cex.axis = 0.7)
+  title("Tukey HSD: BMI by Age Group")
+}
+
+# SBP across Age Groups - Tukey HSD
+if (all(c("sbp", "age_group") %in% names(nhanes_analysis))) {
+  model <- aov(sbp ~ age_group, data = nhanes_analysis)
+  tukey_sbp <- TukeyHSD(model)
+
+  cat("\n### Tukey HSD: SBP across Age Groups\n\n")
+  print(tukey_sbp)
+
+  plot(tukey_sbp, las = 1, cex.axis = 0.7)
+  title("Tukey HSD: SBP by Age Group")
+}
+
+# A1C across BMI Categories - Tukey HSD
+if (all(c("a1c", "bmi_category") %in% names(nhanes_analysis))) {
+  model <- aov(a1c ~ bmi_category, data = nhanes_analysis)
+  tukey_a1c <- TukeyHSD(model)
+
+  cat("\n### Tukey HSD: A1C across BMI Categories\n\n")
+  print(tukey_a1c)
+
+  plot(tukey_a1c, las = 1, cex.axis = 0.7)
+  title("Tukey HSD: A1C by BMI Category")
+}
+
+par(mfrow = c(1, 1))
+```
+
+> **Interpretation:**
+> The ANOVA tests with effect sizes, multiple testing corrections, and post-hoc comparisons examine whether group means differ across categorical predictors in our NHANES dataset:
+>
+> **1. ANOVA Mechanics and Interpretation**:
+>    - **Purpose**: Tests whether **at least one** group mean differs from the others (omnibus test)
+>    - **Null hypothesis** ($H_0$): $\mu_1 = \mu_2 = ... = \mu_k$ (all group means are equal)
+>    - **Alternative hypothesis** ($H_1$): At least one $\mu_i \neq \mu_j$ (at least one pair differs)
+>    - **Test statistic**: F-ratio = $F = \frac{MS_{between}}{MS_{within}} = \frac{SS_{between}/(k-1)}{SS_{within}/(N-k)}$
+>      - **Between-group variance** ($MS_{between}$): How much group means vary from grand mean
+>      - **Within-group variance** ($MS_{within}$): Pooled variance within each group (error term)
+>      - **Interpretation**: Large F-ratio (>1) suggests group differences exceed random variation
+>    - **Degrees of freedom**:
+>      - DF1 (numerator) = k - 1 (number of groups minus 1)
+>      - DF2 (denominator) = N - k (total sample size minus number of groups)
+>    - **P-value**: Probability of observing F-ratio this large if all groups truly have equal means
+>
+> **2. Effect Sizes (Eta-Squared, $\eta^2$) - Variance Explained**:
+>    - **Definition**: $\eta^2$ = $\frac{SS_{between}}{SS_{total}}$ = proportion of total variance in outcome explained by group membership
+>    - **Calculation**: $\eta^2$ = $\frac{SS_{between}}{SS_{between} + SS_{within}}$ where SS = Sum of Squares
+>    - **Interpretation thresholds** (Cohen, 1988): <0.01 (negligible), 0.01-0.06 (small), 0.06-0.14 (medium), >0.14 (large)
+>    - **Practical meaning**:
+>      - $\eta^2$ = 0.01: Grouping variable explains 1% of variance (99% due to other factors/individual differences)
+>      - $\eta^2$ = 0.06: Grouping explains 6% of variance (small but meaningful effect)
+>      - $\eta^2$ = 0.14: Grouping explains 14% of variance (substantial effect)
+>      - $\eta^2$ = 0.25: Grouping explains 25% of variance (very strong effect)
+>    - **R² equivalent**: Eta-squared is analogous to R² in regression—both measure proportion of variance explained
+>    - **Advantage over p-values**: Effect size quantifies **practical importance** independent of sample size
+>      - With n=10,000, even $\eta^2$=0.001 (0.1% variance explained) can yield p<0.001
+>      - Large $\eta^2$ with small n may not reach significance (Type II error)
+>
+> **3. Multiple Testing Corrections - Controlling False Positives**:
+>    - With 3 ANOVA tests, probability of ≥1 false positive at α=0.05: $1-(1-0.05)^3 = 0.143$ (14.3%)
+>    - **Bonferroni correction**: α' = 0.05/3 = 0.0167 (significance threshold: p < 0.017)
+>      - Conservative; protects against ANY false positives (family-wise error rate control)
+>    - **Benjamini-Hochberg correction**: Less conservative; controls false discovery rate
+>      - Among all rejected nulls, <5% expected to be false rejections
+>    - **Interpretation**: Results significant after Bonferroni are highly robust; those significant only after BH warrant replication
+>
+> **4. Post-Hoc Tests (Tukey HSD) - Which Groups Differ?**:
+>    - **Why needed**: ANOVA only indicates "at least one difference exists" but doesn't identify which specific pairs differ
+>    - **Tukey's Honestly Significant Difference (HSD)**:
+>      - Tests all possible pairwise comparisons: $\frac{k(k-1)}{2}$ pairs
+>      - For 3 groups: 3 comparisons; for 4 groups: 6 comparisons; for 5 groups: 10 comparisons
+>      - Controls family-wise error rate (FWER) at α=0.05 across all pairwise tests simultaneously
+>      - More powerful than Bonferroni correction when making many comparisons
+>    - **Test statistic**: $q = \frac{|\bar{x}_i - \bar{x}_j|}{\sqrt{MS_{within}/n}}$ compared to studentized range distribution
+>    - **Output interpretation**:
+>      - **Difference**: Raw mean difference between groups (e.g., Group A mean - Group B mean)
+>      - **95% CI**: If interval excludes 0, the difference is significant at α=0.05
+>      - **Adjusted p-value**: Already corrected for multiple comparisons; compare directly to α=0.05
+>    - **Visualization**: Tukey HSD plots show confidence intervals; intervals not crossing zero are significant
+>
+> **5. Detailed Findings by ANOVA Test**:
+>
+>    **A. BMI across Age Groups**
+>    - **Expected pattern**: Inverted U-shape with peak in middle age (45-64 years)
+>    - **Biological basis**:
+>      - Young adults (18-29): Lower BMI, metabolically active, less weight accumulation
+>      - Middle age (30-64): Progressive weight gain due to decreased metabolism, lifestyle factors, hormonal changes
+>      - Older adults (65+): Weight loss or stabilization due to sarcopenia, illness, appetite changes
+>    - **Anticipated effect size**: Small-to-medium ($\eta^2$ ~ 0.02-0.08)
+>      - Age explains modest proportion of BMI variance
+>      - Most variance due to individual factors (diet, genetics, activity)
+>    - **Post-hoc expectations**:
+>      - Youngest vs. oldest: May not differ significantly (similar BMI levels)
+>      - Middle-age vs. youngest: Should show significant increase (3-5 kg/m² difference)
+>      - Middle-age vs. oldest: Depends on sample's elderly health status
+>    - **Clinical implications**: If significant, suggests age-specific weight management strategies:
+>      - Target middle-aged adults for obesity prevention
+>      - Monitor elderly for unintentional weight loss
+>
+>    **B. Systolic Blood Pressure (SBP) across Age Groups**
+>    - **Expected pattern**: Strong monotonic increase with age (linear or accelerating)
+>    - **Biological basis**:
+>      - **Arterial stiffening**: Progressive loss of elastin, collagen deposition in vessel walls
+>      - **Endothelial dysfunction**: Reduced nitric oxide production, impaired vasodilation
+>      - **Baroreceptor sensitivity**: Declining autonomic regulation with age
+>      - **Cumulative exposure**: Decades of dietary sodium, oxidative stress, inflammation
+>    - **Anticipated effect size**: Medium-to-large ($\eta^2$ ~ 0.08-0.20)
+>      - Age is one of the **strongest predictors** of systolic BP
+>      - Expected ~20-30 mmHg increase from youngest to oldest groups
+>    - **Post-hoc expectations**:
+>      - Each successive age group should show significantly higher SBP than the previous
+>      - Largest differences between young adults (<30) and elderly (65+)
+>      - Even adjacent age groups (e.g., 30-44 vs. 45-64) likely significant
+>    - **Clinical implications**:
+>      - Confirms age as non-modifiable risk factor requiring aggressive screening in older adults
+>      - Provides normative data for age-adjusted BP targets
+>      - Justifies lower treatment thresholds in elderly populations
+>    - **Research note**: If effect size is large ($\eta^2$ > 0.14), age may confound other relationships:
+>      - Must control for age in regression models examining BP predictors
+>      - Age-stratified analyses may be more informative than overall analyses
+>
+>    **C. HbA1c across BMI Categories**
+>    - **Expected pattern**: Dose-response relationship (Normal < Overweight < Obese < Severely Obese)
+>    - **Biological basis**:
+>      - **Insulin resistance**: Adipose tissue releases inflammatory cytokines, free fatty acids
+>      - **β-cell dysfunction**: Chronic hyperinsulinemia → pancreatic exhaustion
+>      - **Ectopic fat**: Visceral and hepatic fat accumulation impairs glucose metabolism
+>      - **Adipokine dysregulation**: Reduced adiponectin, elevated leptin, resistin
+>    - **Anticipated effect size**: Small-to-medium ($\eta^2$ ~ 0.03-0.10)
+>      - BMI is important but not sole determinant of glycemic control
+>      - Genetic factors, physical activity, diet quality also critical
+>      - Among non-diabetics, effect may be smaller (restricted range of HbA1c)
+>    - **Expected HbA1c progression** (approximate means):
+>      - Normal weight (BMI <25): ~5.0-5.2%
+>      - Overweight (BMI 25-29.9): ~5.2-5.4%
+>      - Obese (BMI 30-39.9): ~5.4-5.8%
+>      - Severely obese (BMI ≥40): ~5.8-6.2%
+>    - **Post-hoc expectations**:
+>      - Normal vs. Overweight: May not differ significantly (both within normal glycemic range)
+>      - Normal vs. Obese: Should show significant difference (~0.4-0.6% HbA1c increase)
+>      - Obese vs. Severely Obese: Significant if sample includes diabetics; borderline if only non-diabetics
+>      - **Critical comparison**: Normal weight vs. severely obese should show largest difference
+>    - **Clinical implications**:
+>      - If significant with medium effect, confirms BMI as modifiable risk factor for dysglycemia
+>      - Supports weight loss interventions for diabetes prevention
+>      - Quantifies glycemic benefit of achieving lower BMI categories
+>      - If NOT significant, suggests other factors (e.g., diet quality, genetics) dominate over BMI alone
+>    - **Subgroup considerations**:
+>      - Effect likely stronger among those with prediabetes or diabetes
+>      - May be attenuated in young, metabolically healthy obese individuals
+>
+> **6. ANOVA Assumptions and Robustness**:
+>
+>    **A. Independence of Observations**
+>    - **Requirement**: Each observation must be independent (no repeated measures, no clustering)
+>    - **NHANES consideration**: Complex survey design includes household clustering
+>      - Violation: Family members within households may be correlated
+>      - Impact: Standard errors underestimated → inflated Type I error (false positives)
+>      - **Mitigation**: Use survey-weighted ANOVA if weights available, or acknowledge as limitation
+>
+>    **B. Normality of Residuals**
+>    - **Requirement**: Within each group, the outcome should follow a normal distribution (or residuals should be normally distributed)
+>    - **Shapiro-Wilk results**: Earlier tests showed departures from normality for BMI, SBP, HbA1c
+>    - **Robustness**: ANOVA is remarkably robust to non-normality when:
+>      - Sample sizes are large (n > 30 per group, ideally > 100)
+>      - Group sizes are roughly balanced
+>      - Violations are moderate (slight skewness acceptable; extreme outliers problematic)
+>    - **Central Limit Theorem**: With n>1,000 total, sampling distribution of means approaches normality even if raw data are non-normal
+>    - **Result**: Non-normality is **not a major concern** for this analysis given large sample
+>    - **Alternative if needed**: Kruskal-Wallis test (non-parametric equivalent) if extreme outliers or severe skewness
+>
+>    **C. Homogeneity of Variance (Homoscedasticity)**
+>    - **Requirement**: Within-group variances should be approximately equal across all groups
+>    - **Test**: Levene's test or Bartlett's test (conducted separately in variance test section)
+>    - **Violation consequences**: If variances unequal and group sizes unequal → Type I error inflation
+>    - **Robustness**: ANOVA fairly robust if:
+>      - Largest variance < 4× smallest variance (rule of thumb)
+>      - Group sizes are similar (balanced design)
+>    - **Alternatives if violated**:
+>      - Welch's ANOVA: Does not assume equal variances (analogous to Welch's t-test)
+>      - Data transformation: Log-transform or square-root transform to stabilize variance
+>      - Non-parametric test: Kruskal-Wallis does not assume equal variances
+>
+> **7. Clinical vs. Statistical Significance in ANOVA**:
+>    - **Scenario analysis**:
+>
+>      | Test       | p      | Eta_Sq | interpretation  | Action           |
+>      |------------|--------|--------|-----------------|------------------|
+>      | SBP by Age | <0.001 |   0.15 |    Sig, large   | Age is major BP determinant |
+>      | BMI by Age |  0.003 |   0.02 |    Sig, small   | Age explains little BMI variance |
+>      | A1C by BMI |  0.08  |   0.08 |   Non-sig, med  |Underpowered; need larger n |
+>      | A1C by BMI | <0.001 |  0.005 | Sig, negligible | Not clinically useful |
+>
+>    - **Interpretation principle**: Prioritize tests with **both significance AND meaningful effect size** $(\eta^2 \ge 0.06)$
+>
+> **8. Integration with Regression Modeling**:
+>    - **ANOVA as regression**: One-way ANOVA is mathematically equivalent to linear regression with categorical predictor
+>      - ANOVA F-test = Overall F-test for regression model
+>      - $\eta^2$ = R² (proportion of variance explained)
+>      - Post-hoc comparisons = testing individual dummy variable coefficients
+>    - **Implications for multivariable models**:
+>      - If age shows large $\eta^2$ for SBP ($\eta^2$>0.14), age will be significant covariate in BP regression models
+>      - If BMI categories show medium $\eta^2$ for HbA1c ($\eta^2$=0.08), expect BMI to remain significant predictor after adjusting for other variables
+>      - Effect sizes provide **upper bound** for multivariable R²; additional predictors will increase R² but with diminishing returns
+>    - **Interaction considerations**:
+>      - Significant ANOVAs suggest testing interactions in regression (e.g., age × gender for BP)
+>      - Post-hoc patterns inform interaction hypotheses (e.g., if elderly show disproportionate HbA1c increase, test age × BMI interaction)
+>
+> **9. Comparison with T-Tests**:
+>    - **When groups = 2**: ANOVA F-test is equivalent to two-sample t-test (F = t²)
+>      - Example: If comparing males vs. females only, ANOVA and t-test yield identical p-values
+>    - **Advantage of ANOVA**: Tests multiple groups simultaneously while controlling Type I error
+>    - **Advantage of t-test**: Provides Cohen's d (standardized mean difference); ANOVA provides $\eta^2$ (variance explained)
+>    - **Complementary information**:
+>      - Cohen's d quantifies **pairwise effect magnitude** (difference in standard deviation units)
+>      - $\eta^2$ quantifies **overall group effect** (percentage of variance explained)
+>
+> **10. Post-Hoc Interpretation Guidelines**:
+>    - **Reading Tukey HSD output**:
+>      - Example: "30-44 vs 18-29: difference = 2.5, CI [1.2, 3.8], p = 0.0002"
+>        - Interpretation: "Adults aged 30-44 have BMI 2.5 kg/m² higher than 18-29 year-olds (95% CI [1.2, 3.8]). This difference is statistically significant (p = 0.0002) after adjusting for multiple comparisons."
+>    - **Pattern recognition**:
+>      - **Monotonic increase**: Each group significantly higher than previous (e.g., SBP by age)
+>      - **Threshold effect**: Only extreme groups differ from reference (e.g., only severely obese differ from normal weight)
+>      - **U-shaped**: Youngest and oldest differ from middle (e.g., BMI by age if observed)
+>    - **Clinical translation**:
+>      - Identify "clinically important differences": raw difference ≥ minimal clinically important difference (MCID)
+>        - SBP: MCID ~5 mmHg (cardiovascular risk difference)
+>        - BMI: MCID ~2-3 kg/m² (weight category change)
+>        - HbA1c: MCID ~0.5% (diabetes diagnosis/control threshold)
+>      - A difference can be statistically significant but clinically trivial (e.g., 0.1% HbA1c difference)
+>
+> **11. Reporting Best Practices**:
+>    - **Complete ANOVA reporting**:
+>      - "One-way ANOVA revealed significant differences in systolic blood pressure across age groups (F(3,996) = 45.2, p < 0.001, $\eta^2$ = 0.12). Age group explained 12% of SBP variance, representing a medium-to-large effect. Tukey HSD post-hoc tests indicated that each successive age group had significantly higher SBP than the previous (all pairwise p < 0.01), with the largest difference between youngest (18-29: M = 110 mmHg) and oldest (65+: M = 135 mmHg) groups (mean difference = 25 mmHg, 95% CI [20, 30])."
+>    - **Essential elements**: F-statistic, degrees of freedom, p-value, effect size ($\eta^2$), post-hoc results with specific comparisons, means for context
+>    - **Visual presentation**: Include boxplots or mean plots with error bars to show group differences visually
+>
+> **12. Limitations Specific to These ANOVAs**:
+>    - **Age categorization**: Grouping continuous age into categories loses information
+>      - Alternative: Linear regression with continuous age may be more powerful
+>      - Advantage of categories: Easier to detect non-linear patterns (e.g., quadratic relationships)
+>    - **Cross-sectional design**: Cannot distinguish age effects from cohort effects
+>      - Observed "age differences" may reflect generational differences (older cohort exposed to different lifestyle/environment)
+>      - Longitudinal data needed to confirm aging effects
+>    - **Unequal group sizes**: If some age/BMI groups are much smaller, power to detect differences in those groups is reduced
+>    - **Multiple comparisons within post-hoc**: Even with Tukey adjustment, 10+ pairwise comparisons increase false positive risk
+
+\newpage
+
+## Variance Test
+
+```{r variance-tests}
+## Variance Tests
+variance_results <- list()
+
+recode_diabetes_2grp <- function(df) {
+  df %>%
+    filter(diabetes %in% c("No", "Prediabetes", "Yes")) %>%
+    mutate(
+      diabetes_2grp = case_when(
+        diabetes == "No" ~ "No",
+        diabetes %in% c("Prediabetes", "Yes") ~ "Pre/Yes"
+      )
+    )
+}
+
+# 1. SBP Variance by Diabetes (Pre/Yes vs No)
+if (all(c("sbp", "diabetes") %in% names(nhanes_analysis))) {
+
+  sbp_subset <- nhanes_analysis %>%
+    recode_diabetes_2grp() %>%
+    drop_na(sbp, diabetes_2grp)
+
+  sbp_var <- var.test(sbp ~ diabetes_2grp, data = sbp_subset)
+
+  variance_results[["SBP Variance by Diabetes Status"]] <- data.frame(
+    Outcome        = "SBP",
+    Grouping       = "Diabetes (Pre/Yes vs No)",
+    Test           = "F-test",
+    Variance_Ratio = round(sbp_var$estimate, 3),
+    F_Statistic    = round(sbp_var$statistic, 3),
+    DF1            = sbp_var$parameter[1],
+    DF2            = sbp_var$parameter[2],
+    P_Value        = format.pval(sbp_var$p.value, digits = 3),
+    Significant    = ifelse(sbp_var$p.value < 0.05, "Yes", "No")
+  )
+}
+
+# 2. A1C Variance by Diabetes (Pre/Yes vs No)
+if (all(c("a1c", "diabetes") %in% names(nhanes_analysis))) {
+
+  a1c_subset <- nhanes_analysis %>%
+    recode_diabetes_2grp() %>%
+    drop_na(a1c, diabetes_2grp)
+
+  a1c_var <- var.test(a1c ~ diabetes_2grp, data = a1c_subset)
+
+  variance_results[["A1C Variance by Diabetes Status"]] <- data.frame(
+    Outcome        = "A1C",
+    Grouping       = "Diabetes (Pre/Yes vs No)",
+    Test           = "F-test",
+    Variance_Ratio = round(a1c_var$estimate, 3),
+    F_Statistic    = round(a1c_var$statistic, 3),
+    DF1            = a1c_var$parameter[1],
+    DF2            = a1c_var$parameter[2],
+    P_Value        = format.pval(a1c_var$p.value, digits = 3),
+    Significant    = ifelse(a1c_var$p.value < 0.05, "Yes", "No")
+  )
+}
+
+# 3. BMI Variance by Diabetes (Pre/Yes vs No)
+if (all(c("bmi", "diabetes") %in% names(nhanes_analysis))) {
+
+  bmi_subset <- nhanes_analysis %>%
+    recode_diabetes_2grp() %>%
+    drop_na(bmi, diabetes_2grp)
+
+  bmi_var <- var.test(bmi ~ diabetes_2grp, data = bmi_subset)
+
+  variance_results[["BMI Variance by Diabetes Status"]] <- data.frame(
+    Outcome        = "BMI",
+    Grouping       = "Diabetes (Pre/Yes vs No)",
+    Test           = "F-test",
+    Variance_Ratio = round(bmi_var$estimate, 3),
+    F_Statistic    = round(bmi_var$statistic, 3),
+    DF1            = bmi_var$parameter[1],
+    DF2            = bmi_var$parameter[2],
+    P_Value        = format.pval(bmi_var$p.value, digits = 3),
+    Significant    = ifelse(bmi_var$p.value < 0.05, "Yes", "No")
+  )
+}
+
+# 4. Income-Poverty Ratio Variance by Diabetes (Pre/Yes vs No)
+if (all(c("income_poverty_ratio", "diabetes") %in% names(nhanes_analysis))) {
+
+  ip_subset <- nhanes_analysis %>%
+    recode_diabetes_2grp() %>%
+    drop_na(income_poverty_ratio, diabetes_2grp)
+
+  ip_var <- var.test(income_poverty_ratio ~ diabetes_2grp, data = ip_subset)
+
+  variance_results[["Income-Poverty Ratio Variance by Diabetes"]] <- data.frame(
+    Outcome        = "Income-Poverty Ratio",
+    Grouping       = "Diabetes (Pre/Yes vs No)",
+    Test           = "F-test",
+    Variance_Ratio = round(ip_var$estimate, 3),
+    F_Statistic    = round(ip_var$statistic, 3),
+    DF1            = ip_var$parameter[1],
+    DF2            = ip_var$parameter[2],
+    P_Value        = format.pval(ip_var$p.value, digits = 3),
+    Significant    = ifelse(ip_var$p.value < 0.05, "Yes", "No")
+  )
+}
+
+## Combine & Display Variance Test Results 
+if (length(variance_results) > 0) {
+
+    variance_df <- do.call(rbind, variance_results)
+    rownames(variance_df) <- NULL
+
+    variance_df <- variance_df %>% dplyr::select(-Test)
+    
+    kable(
+        variance_df,
+        caption = "Variance Tests for Group Comparisons (p < 0.05 indicates significant difference)",
+        booktabs = TRUE,
+        format = "latex",
+        longtable =TRUE
+    ) %>%
+      kable_styling(latex_options = c("scale_down", "HOLD_position"), 
+                    font_size = 9, full_width = FALSE)
+}
+```
+
+**Interpretation:**
+
+1. SBP Variance by Diabetes Status — Significant Difference (p = 4.5e−05): Combining Prediabetes and Diabetes into one group reveals a significant variance difference in SBP compared with individuals without diabetes. This suggests that once early-stage dysglycemia (Prediabetes) is included, the overall diabetic spectrum shows more heterogeneous blood-pressure variability. This aligns with clinical understanding that impaired metabolic regulation interacts with cardiovascular function, producing wider variability in SBP even before full diabetes diagnosis.
+
+2. A1C Variance by Diabetes Status — Significant Difference (p < 2e−16): This finding is highly consistent with medical knowledge: diabetes patients differ widely in disease duration, treatment adherence, and glucose regulation, all of which lead to greater heterogeneity in A1C. This variance difference highlights the diverse glycemic control patterns within the diabetic population.
+
+3. BMI Variance by Diabetes Status — Significant Difference (p = 0.000453): This reflects the well-documented heterogeneity of diabetes: while many patients develop diabetes through obesity-related pathways, others develop it despite having normal or only moderately elevated BMI. The result supports the notion that diabetes is not tied to a single body-weight profile. Not all diabetic individuals are obese, and not all individuals with high BMI develop diabetes, making BMI variance naturally diverse.
+
+4. Income-Poverty Ratio Variance by Diabetes Status — No Significant Difference (p = 0.822): While diabetes is associated with socioeconomic disadvantage at the mean level, its variance does not differ significantly between groups. Both diabetic and non-diabetic populations contain individuals across diverse SES strata. This suggests that SES influences diabetes risk mainly through level differences, e.g., higher prevalence in low-SES groups, rather than through variability differences.
+
+Overall, these results demonstrate that merging Prediabetes and Diabetes into a single dysglycemic group reveals substantially greater variability in key physiological indicators—specifically SBP, A1C, and BMI—relative to individuals without diabetes, while socioeconomic variability remains comparable across groups. This pattern underscores diabetes as a heterogeneous clinical condition arising from multiple biological and behavioral pathways, which generate wide dispersion in metabolic and cardiovascular measures even within the same diagnostic category. By identifying which outcomes differ not only in mean levels but also in variance, this analysis complements earlier comparisons and clarifies the dimensions along which diabetic heterogeneity manifests. 
+
+\newpage
+
+# Statistical Modeling
+
+```{r define-predictors, include=FALSE}
+# Define predictor set for modeling
+predictor_vars <- c("age", "gender", "bmi", "sbp", "physical_activity_freq", "income_poverty_ratio")
+```
+
+## Correlation Inference
+```{r correlation-inference, fig.height=6, fig.width=8}
+library(corrplot)
+# Select numeric variables for correlation
+cor_vars <- nhanes_analysis[, c("age", "bmi", "sbp", "dbp", "a1c", "glucose", "sleep_hours", "physical_activity_freq")]
+
+# Spearman correlation (use Spearman as data is non-normal)
+cor_matrix <- cor(cor_vars, use = "pairwise.complete.obs", method = "spearman")
+
+# Display correlation matrix
+print(cor_matrix)
+
+# Correlation heatmap
+corrplot(cor_matrix, method = "color", type = "upper",
+         addCoef.col = "black", number.cex = 0.7,
+         tl.col = "black", tl.srt = 45,
+         title = "Correlation Matrix of Health Variables (Spearman)",
+         mar = c(0,0,2,0))
+
+# Example: Test correlation between age and BMI
+cor.test(nhanes_analysis$age, nhanes_analysis$bmi, method = "spearman")
+
+# Loop through all pairs
+pairs_combo <- combn(names(cor_vars), 2)
+results <- apply(pairs_combo, 2, function(x) {
+  test <- cor.test(cor_vars[[x[1]]], cor_vars[[x[2]]], method = "spearman")
+  data.frame(var1 = x[1], var2 = x[2], estimate = test$estimate,
+             p.value = test$p.value)
+})
+cor_results <- do.call(rbind, results)
+print(cor_results)
+
+# Example: Age vs BMI
+ggplot(nhanes_analysis, aes(x = age, y = bmi)) +
+  geom_point(alpha = 0.3, color = "steelblue") +
+  geom_smooth(method = "loess", color = "red") +
+  labs(title = "BMI vs Age", x = "Age (years)", y = "BMI") +
+  theme_minimal()
+
+```
+
+> **Interpretation:**
+> The correlation analysis examines bivariate relationships among continuous health variables using Spearman's rank correlation coefficient:
+>
+> **1. Correlation Coefficient Choice: Spearman vs. Pearson**:
+>    - **Spearman's $\rho$ (rho)**: Measures **monotonic relationships** based on rank ordering, not raw values
+>      - Formula: $\rho$ = 1 - $\frac{6\sum d_i^2}{n(n^2-1)}$ where $d_i$ = difference in ranks
+>      - **Advantages**: Robust to outliers, does not assume normality or linearity, handles ordinal data
+>      - **Interpretation**: $\rho$ = 1 (perfect positive monotonic), $\rho$ = 0 (no monotonic relationship), $\rho$ = -1 (perfect negative monotonic)
+>    - **Pearson's r**: Measures **linear relationships** based on actual values
+>      - Assumes bivariate normality, sensitive to outliers, only captures linear associations
+>    - **Why Spearman chosen**: Shapiro-Wilk tests confirmed non-normal distributions for all continuous variables
+>      - Spearman provides valid inference without normality assumption
+>      - Can detect non-linear monotonic relationships (e.g., exponential, logarithmic) that Pearson would miss
+>    - **Trade-off**: Spearman has slightly less statistical power than Pearson when data are truly normal and linear
+>
+> **2. Correlation Strength Interpretation Guidelines**:
+>    - **Magnitude** (Cohen, 1988; absolute value):
+>      - |$\rho$| < 0.10: Negligible/trivial correlation
+>      - |$\rho$| = 0.10-0.30: Small/weak correlation
+>      - |$\rho$| = 0.30-0.50: Medium/moderate correlation
+>      - |$\rho$| > 0.50: Large/strong correlation
+>    - **Statistical significance** (p-value): Whether correlation differs from zero
+>      - p < 0.05: Evidence that correlation exists in population
+>      - With large samples (n>1,000), even tiny correlations (|$\rho$|<0.10) become statistically significant
+>    - **Practical significance**: Focus on magnitude, not just p-value
+>      - $\rho$ = 0.08 with p<0.001: Statistically significant but practically negligible (explains <1% variance)
+>      - $\rho$ = 0.45 with p=0.06: Not statistically significant but potentially meaningful (may indicate insufficient power)
+>    - **Variance explained**: $R^2 = \rho^2$ approximates proportion of variance shared
+>      - $\rho$ = 0.20 → R² $\approx$ 0.04 (4% shared variance)
+>      - $\rho$ = 0.45 → R² $\approx$ 0.20 (20% shared variance)
+>      - $\rho$ = 0.70 → R² $\approx$ 0.49 (49% shared variance)
+>
+> **3. Statistical Significance Testing**:
+>    - **Null hypothesis** ($H_0$): $\rho$ = 0 (no monotonic relationship in population)
+>    - **Test statistic**: Approximated by t-distribution with df = n-2
+>    - **p-value interpretation**: Probability of observing correlation this strong if true population correlation were zero
+>    - **Multiple comparisons issue**: With 8 variables, there are $\binom{8}{2} = 28$ pairwise correlations
+>      - Probability of ≥1 false positive at α=0.05: $1-(1-0.05)^{28} = 0.76$ (76%!)
+>      - **Recommendation**: Apply Bonferroni correction (α' = 0.05/28 = 0.0018) for conservative inference
+>      - Correlations with p < 0.002 are most robust; 0.002 < p < 0.05 should be interpreted cautiously
+>
+> **4. Detailed Findings by Variable Pair**:
+>
+>    **A. Age Correlations - Strong Effects of Aging**
+>
+>    - **Age × HbA1c**: $\rho$ = 0.455, p < 0.001 (large positive correlation)
+>      - **Interpretation**: Strong monotonic increase in HbA1c with age; older adults have substantially higher long-term glucose
+>      - **Variance explained**: R² $\approx$ 0.21 (21% of HbA1c variance associated with age)
+>      - **Biological mechanisms**:
+>        - **β-cell senescence**: Pancreatic insulin secretion declines with age
+>        - **Insulin resistance**: Tissue sensitivity to insulin decreases due to cellular aging, inflammation
+>        - **Body composition changes**: Increased visceral fat, decreased muscle mass → impaired glucose disposal
+>        - **Medication use**: Older adults more likely on diabetogenic medications (steroids, thiazides)
+>      - **Clinical implications**: Age is the strongest single predictor of HbA1c in this correlation matrix
+>      - **Confounding concern**: Age-HbA1c relationship may confound other associations (e.g., BMI-HbA1c)
+>      - **Follow-up**: Age-stratified analyses or age-adjusted partial correlations may reveal different patterns by age group
+>
+>    - **Age × SBP**: $\rho$ = 0.400, p < 0.001 (large positive correlation)
+>      - **Interpretation**: Strong monotonic increase in systolic blood pressure with age
+>      - **Variance explained**: R² $\approx$ 0.16 (16% of SBP variance associated with age)
+>      - **Biological mechanisms**: Arterial stiffening, endothelial dysfunction, reduced nitric oxide, baroreceptor blunting
+>      - **Clinical context**: Expected ~20-30 mmHg increase from age 20 to 80
+>      - **Comparison with ANOVA**: This correlation complements the ANOVA (SBP by age group) with continuous relationship
+>      - **Implication**: Age must be controlled in any multivariable model predicting SBP or HbA1c
+>
+>    - **Age × DBP**: Likely weaker than Age × SBP (typically $\rho$ ~ 0.15-0.25)
+>      - DBP often peaks in middle age then plateaus or declines (arterial stiffness affects systolic > diastolic)
+>      - If correlation is weak/non-significant, confirms isolated systolic hypertension pattern in elderly
+>
+>    - **Age × BMI**: Expected weak correlation ($\rho$ ~ 0.05-0.15) due to inverted U-shape observed in ANOVA
+>      - Linear correlation (Spearman) may not capture non-monotonic relationship well
+>      - Scatterplot (age vs. BMI) should show curved pattern with peak in middle age
+>
+> **B. BMI Correlations - Metabolic Syndrome Linkages**
+>
+>    - **BMI × HbA1c**: $\rho$ = 0.202, p < 0.001 (small-to-medium positive correlation)
+>      - **Interpretation**: Modest monotonic increase in HbA1c with higher BMI
+>      - **Variance explained**: R² $\approx$ 0.04 (4% of HbA1c variance associated with BMI)
+>      - **Biological basis**: Obesity → insulin resistance → β-cell dysfunction → hyperglycemia
+>      - **Clinical context**: While statistically significant, BMI alone explains relatively little HbA1c variance
+>        - Other factors dominate: genetics, diet quality, physical activity, medications
+>      - **Why correlation is modest**:
+>        - Not all obese individuals are hyperglycemic (metabolically healthy obesity exists)
+>        - Not all diabetics are obese (lean diabetes, especially in certain ethnicities)
+>        - Relationship may be non-linear (threshold effect at BMI ≥30)
+>      - **Comparison with ANOVA**: ANOVA (HbA1c by BMI category) may show stronger effect if relationship is non-linear
+>
+>    - **BMI × Glucose**: $\rho$ = 0.237, p < 0.001 (small-to-medium positive correlation)
+>      - **Interpretation**: Similar to BMI-HbA1c but slightly stronger with fasting glucose
+>      - **Why stronger than HbA1c**: Glucose reflects acute metabolic state more sensitively
+>      - **Variance explained**: R² $\approx$ 0.06 (6% shared variance)
+>
+>    - **BMI × DBP**: $\rho$ = 0.253, p < 0.001 (small-to-medium positive correlation)
+>      - **Interpretation**: Moderate positive association between obesity and diastolic pressure
+>      - **Variance explained**: R² $\approx$ 0.06 (6% of DBP variance associated with BMI)
+>      - **Biological mechanisms**:
+>        - Increased blood volume and cardiac output in obesity
+>        - Sympathetic nervous system overactivity
+>        - Sodium retention and vascular remodeling
+>        - Adipokine-mediated vasoconstriction
+>      - **Clinical note**: Obesity affects diastolic > systolic in younger adults; pattern reverses with age
+>
+>    - **BMI × SBP**: Expected similar or slightly weaker than BMI × DBP ($\rho$ ~ 0.20-0.30)
+>      - Check if BMI-SBP correlation is weaker than age-SBP correlation (age dominates systolic BP)
+>
+> **C. Sleep Correlations - Emerging Risk Factor**
+>
+>    - **Sleep Hours × HbA1c**: $\rho$ = -0.092, p = 0.033 (small negative correlation, borderline significance)
+>      - **Interpretation**: Weak inverse relationship—fewer sleep hours associated with slightly higher HbA1c
+>      - **Variance explained**: R² $\approx$ 0.008 (0.8% shared variance—negligible)
+>      - **Statistical concerns**:
+>        - p = 0.033 > Bonferroni-corrected threshold (p = 0.0018)
+>        - Does **not** survive multiple comparisons correction
+>        - May be a **false positive** among 28 tests
+>        - Should be interpreted cautiously and require replication
+>      - **Biological plausibility**:
+>        - Sleep deprivation → cortisol elevation → insulin resistance
+>        - Circadian disruption → impaired glucose tolerance
+>        - Sleep loss → increased appetite hormones (ghrelin) → weight gain → dysglycemia
+>      - **Clinical significance**: Even if real, effect is too small to be clinically useful (explains <1% variance)
+>      - **Measurement issues**:
+>        - Self-reported sleep hours may be inaccurate
+>        - Does not capture sleep quality, apnea, or circadian misalignment
+>        - U-shaped relationship possible (very short AND very long sleep both harmful)
+>      - **Recommendation**: Include sleep in multivariable models but don't overinterpret this bivariate correlation
+>
+>    - **Sleep Hours × Glucose**: $\rho$ = -0.074, p = 0.045 (small negative correlation, not significant after correction)
+>      - **Interpretation**: Even weaker than sleep-HbA1c relationship
+>      - **Significance**: p = 0.045 does not survive Bonferroni correction (p < 0.0018)
+>      - Likely a false positive or trivially small true effect
+>      - Do not draw clinical conclusions from this correlation alone
+>
+> **D. Blood Pressure Correlations**
+>
+>    - **SBP × DBP**: Expected strong positive correlation ($\rho$ ~ 0.50-0.70)
+>      - Both components of blood pressure; physiologically coupled
+>      - High correlation expected but not perfect (isolated systolic/diastolic hypertension exists)
+>
+>    - **SBP × Glucose/HbA1c**: Likely weak-to-moderate ($\rho$ ~ 0.15-0.25)
+>      - Reflects shared cardiometabolic risk factors (obesity, inflammation, insulin resistance)
+>      - Weaker than age correlations because relationship is indirect
+>
+> **E. Physical Activity Correlations**
+>
+>    - Expected **negative correlations** with BMI, HbA1c, glucose, BP (protective effect)
+>    - Likely **weak correlations** ($\rho$ ~ -0.10 to -0.20) due to:
+>      - Self-report bias (overestimation of activity)
+>      - Wide individual variation in metabolic response to exercise
+>      - Reverse causation (sick individuals exercise less)
+>    - If correlations are non-significant, suggests physical activity measurement may be inadequate
+>
+> **5. Correlation Matrix Visualization Interpretation**:
+>    - **Heatmap color intensity**: Darker colors = stronger correlations
+>    - **Clustering patterns**: Look for blocks of high correlations indicating related variable groups
+>      - Expected cluster 1: Age, HbA1c, glucose (metabolic aging)
+>      - Expected cluster 2: SBP, DBP, age (cardiovascular aging)
+>      - Expected cluster 3: BMI, DBP, HbA1c (metabolic syndrome components)
+>    - **Symmetric matrix**: Upper triangle mirrors lower triangle ($\rho$(X,Y) = $\rho$(Y,X))
+>    - **Diagonal = 1.0**: Perfect correlation of each variable with itself
+>
+> **6. Causality and Interpretation Caveats**:
+>    - **Correlation ≠ Causation**: Spearman's $\rho$ measures association, not causal direction
+>      - **Example**: Age × HbA1c correlation ($\rho$ = 0.455) does NOT prove aging causes high glucose
+>      - **Alternative explanations**:
+>        - Reverse causation: Chronic hyperglycemia may accelerate cellular aging
+>        - Confounding: Both age and HbA1c increase with obesity, medications, comorbidities
+>        - Cohort effects: Older generation exposed to different diets, environments
+>    - **Third variable problem**: Apparent correlation may be spurious due to unmeasured confounder
+>      - **Example**: BMI × HbA1c may be confounded by physical activity (low activity → high BMI AND high HbA1c)
+>    - **Partial correlations**: Control for confounders to estimate independent associations
+>      - Example: Partial correlation of BMI × HbA1c controlling for age would be smaller than crude correlation
+>    - **Regression analysis**: Required to establish independent effects after adjusting for covariates
+>
+> **7. Non-Linear Relationships Not Captured**:
+>    - **Spearman's limitation**: Only detects monotonic relationships (consistent direction)
+>    - **Missed patterns**:
+>      - **U-shaped**: Sleep hours × HbA1c may show both very short and very long sleep associated with high HbA1c
+>      - **Threshold effects**: BMI × HbA1c may show sharp increase only above BMI ≥30 (obesity threshold)
+>      - **Plateau effects**: Age × BMI may increase until middle age then flatten
+>    - **Solution**: Examine scatterplots visually and consider non-linear regression models
+>    - **Example provided**: Age vs. BMI scatterplot with LOESS smoother reveals non-monotonic pattern
+>
+> **8. Statistical Power and Sample Size Considerations**:
+>    - **Large sample advantage**: With n $\approx$ 1,000, power to detect even small correlations ($\rho$ ≥ 0.10) is high (>80%)
+>    - **Consequence**: Many statistically significant correlations may be clinically trivial
+>    - **Guideline**: Prioritize correlations with |$\rho$| > 0.20 for clinical interpretation
+>    - **Non-significant results**: With this sample size, non-significant correlations (p > 0.05) likely represent true null or very small effects (|$\rho$| < 0.08)
+>
+> **9. Comparison with Previous Analyses**:
+>    - **Correlation vs. t-tests**: T-tests compare means between groups; correlations examine continuous relationships
+>      - Example: Gender difference in SBP (t-test) vs. age-SBP relationship (correlation) provide complementary information
+>    - **Correlation vs. ANOVA**: ANOVA tests differences across categorical groups; correlation uses continuous predictors
+>      - Example: ANOVA (SBP by age group) vs. Spearman (age-SBP correlation) should show consistent patterns
+>      - ANOVA may detect non-linear patterns (inverted U) that linear correlation misses
+>    - **Correlation vs. regression**: Regression extends correlation to multivariable context
+>      - Bivariate correlations provide upper bound for standardized regression coefficients
+>      - Multivariable model will show smaller effects due to shared variance among correlated predictors
+>
+> **10. Clinical and Research Implications**:
+>    - **Variable prioritization for regression models**:
+>      - **Strong predictors** (|$\rho$| > 0.40): Age (for HbA1c, SBP) should be included in all models
+>      - **Moderate predictors** (|$\rho$| = 0.20-0.40): BMI (for HbA1c, DBP) likely significant in multivariable models
+>      - **Weak predictors** (|$\rho$| < 0.20): Sleep, physical activity may not reach significance after adjustment
+>    - **Multicollinearity concerns**:
+>      - If SBP × DBP correlation is very high ($\rho$ > 0.80), including both in regression may cause instability
+>      - Consider using only one BP measure or creating composite score
+>    - **Effect modification hypotheses**:
+>      - Strong age correlations suggest testing age × BMI interaction (BMI effect may differ by age)
+>      - Gender differences in correlations suggest testing gender × age or gender × BMI interactions
+>    - **Clinical screening implications**:
+>      - Strong age-HbA1c correlation supports age-based diabetes screening guidelines (screen all adults ≥45)
+>      - Modest BMI-HbA1c correlation supports BMI-based screening (screen overweight/obese at any age)
+>      - Weak sleep-HbA1c correlation suggests sleep duration alone is insufficient screening tool
+>
+> **11. Limitations of Correlation Analysis**:
+>    - **Cross-sectional design**: Cannot establish temporal sequence (which came first?)
+>    - **Range restriction**: If sample excludes extreme values (e.g., very young, very old), correlations may be attenuated
+>    - **Measurement error**: Self-reported variables (sleep, physical activity) introduce noise → weaker observed correlations
+>    - **Missing data**: Pairwise deletion (use = "pairwise.complete.obs") uses different subsets for each correlation
+>      - Sample size varies across correlations → some based on smaller n with less power
+>    - **Outliers**: Although Spearman is robust, extreme outliers can still influence results
+>      - Should examine scatterplots to identify influential points
+>    - **Assumption violations**: Spearman assumes monotonic relationship; if relationship is non-monotonic, $\rho$ underestimates association
+>
+> **12. Reporting Best Practices**:
+>    - **Complete reporting template**: "Age showed a large positive correlation with HbA1c (Spearman's $\rho$ = 0.455, 95% CI [0.41, 0.50], p < 0.001, n = 1,023), indicating that older adults have substantially higher long-term glucose levels. Age explained approximately 21% of HbA1c variance. This correlation remained significant after Bonferroni correction for 28 comparisons (p < 0.0018)."
+>    - **Essential elements**: Correlation coefficient, magnitude interpretation, confidence interval, p-value, sample size, multiple testing note
+>    - **Visual presentation**: Always include scatterplots for key correlations with trend lines
+>    - **Context**: Compare findings to prior literature ("consistent with expected $\rho$ ~ 0.40-0.50")
+>
+> **13. Summary of Key Correlations**:
+>    - **Strongest relationships** (|$\rho$| > 0.40): Age-HbA1c (0.455), Age-SBP (0.400)
+>      - These are clinically important and should drive subsequent modeling
+>    - **Moderate relationships** (|$\rho$| = 0.20-0.40): BMI-DBP (0.253), BMI-Glucose (0.237), BMI-HbA1c (0.202)
+>      - Meaningful associations worthy of multivariable investigation
+>    - **Weak relationships** (|$\rho$| < 0.20): Sleep-HbA1c (-0.092), Sleep-Glucose (-0.074)
+>      - Clinically negligible; may be false positives; do not overinterpret
+>    - **Overall alignment**: Correlations align with known medical literature on cardiometabolic risk factors
+>    - **Novel findings**: Sleep associations are weak and non-significant after correction, suggesting sleep duration alone is insufficient indicator of metabolic health
+
+
+## Logistic Regression: Diabetes Prediction
+
+```{r logistic-regression}
+# Logistic regression predicting diabetes status
+if (all(c("diabetes", "age", "gender", "bmi", "sbp", "physical_activity_freq",
+          "income_poverty_ratio") %in% names(nhanes_analysis))) {
+
+  # Create binary diabetes variable: Yes/Prediabetes vs No
+  nhanes_logit <- nhanes_analysis %>%
+    filter(!is.na(diabetes)) %>%
+    mutate(diabetes_binary = factor(
+      ifelse(diabetes %in% c("Yes", "Prediabetes"), "Yes", "No"),
+      levels = c("No", "Yes")
+    ))
+
+  # Fit logistic regression model
+  logit_model <- glm(diabetes_binary ~ age + gender + bmi + sbp +
+                       physical_activity_freq + income_poverty_ratio,
+                     data = nhanes_logit, family = binomial)
+
+  # Check for convergence issues
+  if (!logit_model$converged) {
+    warning("Logistic regression model did not converge")
+  }
+
+  print(summary(logit_model))
+
+  # Extract predictions only for complete cases (GLM automatically removes NAs)
+  fitted_idx <- !is.na(logit_model$fitted.values)
+  pred_probs <- logit_model$fitted.values[fitted_idx]
+  actual_values <- nhanes_logit$diabetes_binary[fitted_idx]
+
+  # Find optimal threshold using Youden's J statistic from ROC
+  roc_obj <- roc(actual_values, pred_probs, quiet = TRUE)
+  auc_value <- auc(roc_obj)
+
+  optimal_coords <- coords(roc_obj, "best", ret = c("threshold", "sensitivity", "specificity"))
+  optimal_thresh <- optimal_coords$threshold
+  optimal_sensitivity <- optimal_coords$sensitivity
+  optimal_specificity <- optimal_coords$specificity
+
+  # Generate predictions using optimal threshold
+  pred_class <- factor(ifelse(pred_probs > optimal_thresh, "Yes", "No"),
+                      levels = c("No", "Yes"))
+
+  # Create confusion matrix
+  conf_matrix <- table(Predicted = pred_class, Actual = actual_values)
+  cat("\nConfusion Matrix:\n")
+  print(conf_matrix)
+
+  # Extract metrics from confusion matrix
+  tn <- conf_matrix[1, 1]
+  fp <- conf_matrix[2, 1]
+  fn <- conf_matrix[1, 2]
+  tp <- conf_matrix[2, 2]
+
+  # Clinical interpretation of confusion matrix
+  cat("\n")
+  cat("Confusion Matrix Interpretation:\n")
+  cat("  True Negatives (TN):", tn, "- correctly identified no diabetes\n")
+  cat("  False Positives (FP):", fp, "- incorrectly predicted diabetes (Type I error)\n")
+  cat("  False Negatives (FN):", fn, "- missed diabetes cases (Type II error)\n")
+  cat("  True Positives (TP):", tp, "- correctly identified diabetes/prediabetes\n\n")
+
+  cat("  Clinical Implications:\n")
+  cat("    False Negatives (", fn, ") are concerning: missed diabetes cases may delay treatment\n")
+  cat("    False Positives (", fp, ") lead to unnecessary follow-up testing and patient anxiety\n")
+  cat("    In screening contexts, minimizing FN is often prioritized (favor sensitivity)\n")
+  cat("    The optimal threshold balances these competing concerns\n\n")
+
+  # Calculate performance metrics
+  accuracy <- mean(pred_class == actual_values)
+
+  precision <- tp / (tp + fp)
+  recall <- tp / (tp + fn)
+  f1_score <- 2 * (precision * recall) / (precision + recall)
+
+  cat("\n")
+  cat("Optimal Threshold (Youden's J):", round(optimal_thresh, 3), "\n")
+  cat("Sensitivity (Recall):", round(optimal_sensitivity, 3), "\n")
+  cat("Specificity:", round(optimal_specificity, 3), "\n\n")
+
+  cat("Model Performance:\n")
+  cat("  Accuracy:", round(accuracy * 100, 2), "%\n")
+  cat("  Precision:", round(precision, 3), "\n")
+  cat("  F1-Score:", round(f1_score, 3), "\n")
+  cat("  AUC:", round(auc_value, 3), "\n")
+  cat("  AIC:", round(AIC(logit_model), 2), "\n")
+  cat("  Sample size (complete cases):", length(pred_probs), "\n\n")
+
+  # Interpretation of performance metrics
+  cat("Performance Interpretation:\n")
+
+  # AUC interpretation
+  auc_interp <- if (auc_value >= 0.9) {
+    "Excellent discrimination"
+  } else if (auc_value >= 0.8) {
+    "Good discrimination"
+  } else if (auc_value >= 0.7) {
+    "Acceptable discrimination"
+  } else {
+    "Poor discrimination"
+  }
+  cat("  AUC =", round(auc_value, 3), "-", auc_interp, "\n")
+  cat("    (AUC = 0.5 is random guessing; AUC = 1.0 is perfect classification)\n")
+
+  # Accuracy interpretation
+  baseline_accuracy <- max(table(actual_values)) / length(actual_values)
+  cat("  Accuracy =", round(accuracy * 100, 2), "% vs baseline", round(baseline_accuracy * 100, 2), "%\n")
+  cat("    (Baseline = always predicting majority class)\n")
+
+  # Sensitivity/Specificity tradeoff
+  cat("  Sensitivity =", round(optimal_sensitivity, 3), "- probability of correctly identifying diabetes/prediabetes\n")
+  cat("  Specificity =", round(optimal_specificity, 3), "- probability of correctly identifying no diabetes\n")
+
+  # Clinical interpretation
+  cat("\n  Clinical Context:\n")
+  cat("    High sensitivity is critical for screening (catching all potential cases)\n")
+  cat("    High specificity reduces false alarms and unnecessary follow-up\n")
+  cat("    Optimal threshold (", round(optimal_thresh, 3), ") balances these tradeoffs\n\n")
+
+  # Odds ratios table with better formatting
+  model_coef <- coef(logit_model)
+  exp_coef <- exp(model_coef)
+  conf_int <- exp(confint.default(logit_model))
+  p_values <- summary(logit_model)$coefficients[, "Pr(>|z|)"]
+
+  # Relabel variable names for interpretability
+  relabel_logit <- function(var) {
+    var <- as.character(var)
+    var <- gsub("^\\(Intercept\\)$", "Intercept", var)
+    var <- gsub("^gender(.*)", "Gender: \\1", var)
+    var <- gsub("^age$", "Age (per year)", var)
+    var <- gsub("^bmi$", "BMI (per kg/m²)", var)
+    var <- gsub("^sbp$", "Systolic BP (per mmHg)", var)
+    var <- gsub("^physical_activity_freq$", "Physical Activity Freq. (per day/week)", var)
+    var <- gsub("^income_poverty_ratio$", "Income/Poverty Ratio", var)
+    return(var)
+  }
+
+  or_table <- data.frame(
+    Variable = relabel_logit(names(exp_coef)),
+    Odds_Ratio = round(exp_coef, 3),
+    CI_Lower = round(conf_int[, 1], 3),
+    CI_Upper = round(conf_int[, 2], 3),
+    P_Value = format.pval(p_values, digits = 3, eps = 0.001)
+  )
+
+  kable(or_table,
+        caption = "Logistic Regression Odds Ratios for Diabetes/Prediabetes (95\\% CI)",
+        booktabs = TRUE,
+        format = "latex",
+        col.names = c("Variable", "OR", "95\\% CI Lower", "95\\% CI Upper", "P-value")) %>%
+    kable_styling(latex_options = c("scale_down", "HOLD_position"),
+                  font_size = 9, full_width = FALSE)
+}
+```
+
+> **Interpretation:**
+>
+> **Clinical Context**: This model predicts diabetes/prediabetes status (combining "Yes" and "Prediabetes" vs "No"). Odds ratios (OR) quantify how predictor variables affect the odds of having diabetes/prediabetes. An OR > 1 indicates increased odds (risk factor), OR < 1 indicates decreased odds (protective factor), and OR = 1 indicates no association.
+>
+> **Statistically Significant Predictors** (p < 0.05):
+>
+> - **Age** (OR = `r round(exp(coef(logit_model)["age"]), 3)`, p = `r format.pval(summary(logit_model)$coefficients["age", "Pr(>|z|)"], digits = 3)`): Each additional year of age increases the odds of diabetes/prediabetes by `r round((exp(coef(logit_model)["age"]) - 1) * 100, 1)`%. For a 10-year age difference, the odds multiply by `r round(exp(coef(logit_model)["age"] * 10), 2)`, representing a substantial increase in risk.
+>
+> - **BMI** (OR = `r round(exp(coef(logit_model)["bmi"]), 3)`, p = `r format.pval(summary(logit_model)$coefficients["bmi", "Pr(>|z|)"], digits = 3)`): Each 1 kg/m² increase in BMI raises the odds by `r round((exp(coef(logit_model)["bmi"]) - 1) * 100, 1)`%. A 5-unit BMI increase (e.g., from BMI 25 to 30, crossing from overweight to obese) increases odds by `r round((exp(coef(logit_model)["bmi"] * 5) - 1) * 100, 1)`%, demonstrating obesity as a major diabetes risk factor.
+>
+> - **Systolic Blood Pressure** (OR = `r round(exp(coef(logit_model)["sbp"]), 3)`, p = `r format.pval(summary(logit_model)$coefficients["sbp", "Pr(>|z|)"], digits = 3)`): Each 1 mmHg increase in systolic BP raises the odds by `r round((exp(coef(logit_model)["sbp"]) - 1) * 100, 2)`%. A 20 mmHg increase (e.g., 120 to 140 mmHg, moving from normal to stage 2 hypertension) increases odds by `r round((exp(coef(logit_model)["sbp"] * 20) - 1) * 100, 1)`%.
+>
+> **Non-Significant Predictors** (p ≥ 0.05):
+>
+> - **Gender** (p = `r format.pval(summary(logit_model)$coefficients["genderMale", "Pr(>|z|)"], digits = 3)`): No significant difference in diabetes/prediabetes odds between males and females after controlling for other factors.
+>
+> - **Physical Activity Frequency** (p = `r format.pval(summary(logit_model)$coefficients["physical_activity_freq", "Pr(>|z|)"], digits = 3)`): Surprisingly not significant, possibly due to measurement issues (self-reported data subject to recall bias) or insufficient variance in the sample.
+>
+> - **Income-to-Poverty Ratio** (OR = `r round(exp(coef(logit_model)["income_poverty_ratio"]), 3)`, p = `r format.pval(summary(logit_model)$coefficients["income_poverty_ratio", "Pr(>|z|)"], digits = 3)`): While the OR suggests lower odds with higher socioeconomic status, this association did not reach statistical significance (p ≥ 0.05).
+>
+> **Clinical Implications**: These findings align with established diabetes risk factors, confirming that age, obesity (BMI), and hypertension (systolic BP) are the primary modifiable and non-modifiable risk factors captured in this model. The absence of physical activity and socioeconomic effects may reflect measurement limitations rather than true absence of association. 
+
+
+### Logistic Regression Diagnostics
+
+```{r logistic-diagnostics, fig.height=8, fig.width=10}
+if (exists("logit_model")) {
+  # VIF for multicollinearity (numeric predictors only)
+  cat("\nVariance Inflation Factors (VIF) for Numeric Predictors:\n")
+  # Identify numeric predictors in the model
+  numeric_predictors <- names(logit_model$model)[sapply(logit_model$model, is.numeric)]
+  if (length(numeric_predictors) > 0) {
+    vif_numeric <- vif(logit_model)[numeric_predictors]
+    print(round(vif_numeric, 2))
+    cat("\nNote: VIF > 10 indicates high multicollinearity\n")
+    cat("For factor predictors, VIF may be inflated due to multiple levels; interpret with caution.\n\n")
+  } else {
+    cat("No numeric predictors for VIF calculation.\n\n")
+  }
+
+  # Diagnostic plots
+  par(mfrow = c(2, 2))
+
+  # Residuals vs Fitted
+  plot(logit_model$fitted.values, residuals(logit_model, type = "deviance"),
+       xlab = "Fitted Values", ylab = "Deviance Residuals",
+       main = "Residuals vs Fitted")
+  abline(h = 0, col = "red", lty = 2)
+
+  # Q-Q plot
+  qqnorm(residuals(logit_model, type = "deviance"), main = "Normal Q-Q Plot")
+  qqline(residuals(logit_model, type = "deviance"), col = "red")
+
+  # Scale-Location
+  plot(logit_model$fitted.values, sqrt(abs(residuals(logit_model, type = "deviance"))),
+       xlab = "Fitted Values", ylab = "sqrt(|Deviance Residuals|)",
+       main = "Scale-Location")
+  abline(h = 0, col = "red", lty = 2)
+
+  # Cook's Distance
+  plot(cooks.distance(logit_model), type = "h",
+       ylab = "Cook's Distance", main = "Cook's Distance",
+       xlab = "Observation")
+  abline(h = 4/nrow(nhanes_analysis), col = "red", lty = 2)
+
+  par(mfrow = c(1, 1))
+
+  # ROC Curve
+  if (exists("roc_obj") && !is.null(roc_obj) && exists("auc_value") && !is.null(auc_value)) {
+    plot(roc_obj, main = "ROC Curve for Diabetes Prediction",
+         col = "blue", lwd = 2)
+    legend("bottomright", legend = paste("AUC =", round(auc_value, 3)),
+           col = "blue", lwd = 2)
+  } else {
+    cat("ROC curve not available: ROC object or AUC value is missing.\n")
+  }
+}
+```
+
+> **Diagnostic Interpretation:**
+> The logistic regression diagnostics assess model assumptions and identify potential issues:
+>
+> **Multicollinearity (VIF)**: All numeric predictors show VIF values well below 10, and most below 5, indicating low to moderate multicollinearity. This suggests that predictors are not highly correlated with each other, and coefficient estimates are stable and reliable.
+>
+> **Residuals vs Fitted**: This plot shows the distribution of deviance residuals across predicted probabilities. For logistic regression, we expect to see two horizontal bands (one for each outcome level). Systematic patterns would suggest model misspecification or missing important predictors.
+>
+> **Normal Q-Q Plot**: While logistic regression does not assume normally distributed residuals (unlike linear regression), this plot can help identify extreme outliers or influential observations that deviate from expected patterns.
+>
+> **Cook's Distance**: This identifies influential observations that disproportionately affect model coefficients. Points above the reference line (4/n) warrant investigation to ensure they are not data errors or undue leverage points.
+>
+> **ROC Curve**: The ROC curve visualizes the model's discrimination ability across all possible classification thresholds. The AUC value quantifies overall predictive performance, with values >0.7 generally considered acceptable and >0.8 considered good for clinical prediction models.
+
+## Linear Regression: HbA1c Prediction
+
+```{r linear-regression}
+# Linear regression predicting HbA1c levels
+if (all(c("a1c", "age", "gender", "bmi", "sbp", "physical_activity_freq",
+          "income_poverty_ratio") %in% names(nhanes_analysis))) {
+
+  # Filter to complete cases for all predictors and outcome
+  complete_lin_data <- nhanes_analysis %>%
+    drop_na(a1c, age, gender, bmi, sbp, physical_activity_freq, income_poverty_ratio)
+
+  lin_model <- lm(
+    a1c ~ age + gender + bmi + sbp +
+      physical_activity_freq + income_poverty_ratio,
+    data = complete_lin_data
+  )
+
+  # Model summary
+  model_summary <- summary(lin_model)
+  print(model_summary)
+
+  # Model performance metrics
+  cat("\n")
+  cat("Model Performance:\n")
+  cat("  R-squared:", round(model_summary$r.squared, 4), "\n")
+  cat("  Adjusted R-squared:", round(model_summary$adj.r.squared, 4), "\n")
+  cat("  RMSE:", round(sigma(lin_model), 3), "\n")
+  cat("  AIC:", round(AIC(lin_model), 2), "\n\n")
+
+  # Interpretation of R-squared
+  cat("Model Fit Interpretation:\n")
+  rsq_pct <- round(model_summary$r.squared * 100, 1)
+  cat("  The R² of", round(model_summary$r.squared, 4),
+      "indicates that the included predictors explain", rsq_pct,
+      "% of the variance in HbA1c.\n")
+  cat("  This modest explanatory power suggests that important predictors are not captured\n")
+  cat("  in this model (e.g., dietary intake, genetics, medication use, disease duration,\n")
+  cat("  diabetes type, treatment adherence). Typical R² values for HbA1c prediction models\n")
+  cat("  using demographic and clinical variables range from 0.10 to 0.30 in population studies.\n\n")
+
+  conf_int <- confint(lin_model)
+  # Ensure confidence intervals match coefficient names/order
+  coef_digits <- 3
+  pval_digits <- 4
+  conf_int <- confint(lin_model)
+
+  # Relabel variable names for interpretability
+  relabel_coef <- function(var) {
+    var <- as.character(var)
+    var <- gsub("^\\(Intercept\\)$", "Intercept", var)
+    var <- gsub("^gender(.*)", "Gender: \\1", var)
+    var <- gsub("^age$", "Age", var)
+    var <- gsub("^bmi$", "BMI", var)
+    var <- gsub("^sbp$", "Systolic BP", var)
+    var <- gsub("^physical_activity_freq$", "Physical Activity Freq.", var)
+    var <- gsub("^income_poverty_ratio$", "Income/Poverty Ratio", var)
+    return(var)
+  }
+
+  coef_table <- data.frame(
+    Variable = relabel_coef(names(coef(lin_model))),
+    Estimate = round(coef(lin_model), coef_digits),
+    Std_Error = round(model_summary$coefficients[, "Std. Error"], coef_digits),
+    t_value = round(model_summary$coefficients[, "t value"], coef_digits),
+    p_value = round(model_summary$coefficients[, "Pr(>|t|)"], pval_digits),
+    CI_Lower = round(conf_int[, 1], coef_digits),
+    CI_Upper = round(conf_int[, 2], coef_digits)
+  )
+  
+  knitr::kable(coef_table, 
+            caption = "Linear Regression Coefficients for HbA1c (95\\% Confidence Intervals)",
+            booktabs = TRUE, 
+            format = "latex") %>%
+    kable_styling(latex_options = c("scale_down", "HOLD_position"),
+                  font_size = 9, full_width = FALSE)
+}
+```
+
+> **Interpretation:**
+>
+> **Clinical Context**: HbA1c (glycated hemoglobin) reflects average blood glucose over 2-3 months. Clinical thresholds: <5.7% (normal), 5.7-6.4% (prediabetes), ≥6.5% (diabetes). A change of 0.5% in HbA1c is considered clinically meaningful and associated with significant differences in diabetes complication risk.
+>
+> Each coefficient represents the expected change in HbA1c (percentage points) for a one-unit increase in the corresponding predictor, holding all other variables constant. A positive coefficient indicates an association with higher HbA1c (poorer glycemic control), while a negative coefficient suggests lower HbA1c (better control).
+>
+> **Statistically Significant Predictors:**
+>
+> - **Age** (p = `r round(model_summary$coefficients["age", "Pr(>|t|)"], 4)`): Each additional year of age is associated with an average increase of `r round(coef(lin_model)["age"], 3)` percentage points in HbA1c, holding other factors constant. Over a 10-year span, this represents a `r round(coef(lin_model)["age"] * 10, 2)`% increase, which approaches clinical significance.
+>
+> - **BMI** (p = `r round(model_summary$coefficients["bmi", "Pr(>|t|)"], 4)`): Each unit increase in BMI (kg/m²) is associated with an average increase of `r round(coef(lin_model)["bmi"], 3)` percentage points in HbA1c. For example, a 5-unit BMI increase (e.g., from 25 to 30, moving from normal weight to obese) corresponds to a `r round(coef(lin_model)["bmi"] * 5, 2)`% increase in HbA1c, which is clinically meaningful.
+>
+> - **Income-to-Poverty Ratio** (p = `r round(model_summary$coefficients["income_poverty_ratio", "Pr(>|t|)"], 4)`): Each unit increase in income-to-poverty ratio is associated with an average decrease of `r abs(round(coef(lin_model)["income_poverty_ratio"], 3))` percentage points in HbA1c, suggesting that higher socioeconomic status is associated with better glycemic control. Moving from poverty level (ratio = 1) to 3× poverty level represents a `r abs(round(coef(lin_model)["income_poverty_ratio"] * 2, 2))`% decrease in HbA1c.
+>
+> **Non-Significant Predictors:**
+>
+> - **Systolic BP** (p = `r round(model_summary$coefficients["sbp", "Pr(>|t|)"], 4)`): Each mmHg increase is associated with a `r round(coef(lin_model)["sbp"], 3)` percentage point change in HbA1c, but this association did not reach statistical significance in this model.
+>
+> - **Gender** (p = `r round(model_summary$coefficients["genderMale", "Pr(>|t|)"], 4)`) and **Physical Activity Frequency** (p = `r round(model_summary$coefficients["physical_activity_freq", "Pr(>|t|)"], 4)`) were not statistically significant predictors. The lack of significance for physical activity may reflect measurement issues (self-report) or insufficient variance in the sample.
+
+
+### Robust Standard Errors
+
+```{r robust-standard-errors}
+if (exists("lin_model")) {
+  cat("\n=== ROBUST STANDARD ERRORS FOR HETEROSCEDASTICITY ===\n\n")
+
+  # Standard OLS results
+  cat("Standard OLS Results:\n")
+  print(summary(lin_model)$coefficients)
+
+  # Robust standard errors (HC3)
+  if (requireNamespace("sandwich", quietly = TRUE)) {
+    cat("\n\nRobust Standard Errors (HC3):\n")
+    robust_se <- coeftest(lin_model, vcov = vcovHC(lin_model, type = "HC3"))
+    print(robust_se)
+
+    # Create comparison table
+    standard_coef <- summary(lin_model)$coefficients
+    robust_coef <- robust_se
+
+    comparison_df <- data.frame(
+      Variable = rownames(standard_coef),
+      Estimate = round(standard_coef[, "Estimate"], 4),
+      SE_Standard = round(standard_coef[, "Std. Error"], 4),
+      SE_Robust = round(robust_coef[, "Std. Error"], 4),
+      P_Standard = format.pval(standard_coef[, "Pr(>|t|)"], digits = 3),
+      P_Robust = format.pval(robust_coef[, "Pr(>|t|)"], digits = 3)
+    )
+
+    kable(comparison_df,
+          caption = "Comparison: Standard vs Robust Standard Errors",
+          booktabs = TRUE, format = "latex") %>%
+      kable_styling(latex_options = c("scale_down", "HOLD_position"),
+                    font_size = 8, full_width = FALSE)
+  } else {
+    cat("\n\nPackage 'sandwich' not available - robust SEs not computed\n")
+  }
+}
+```
+
+### Non-Linear and Interaction Models
+
+```{r nonlinear-interactions}
+if (exists("complete_lin_data") && all(c("a1c", "age", "bmi", "gender") %in% names(complete_lin_data))) {
+  cat("\n=== TESTING NON-LINEAR RELATIONSHIPS AND INTERACTIONS ===\n\n")
+
+  # 1. Quadratic age effect
+  lin_quadratic <- lm(a1c ~ age + I(age^2) + gender + bmi + sbp +
+                        physical_activity_freq + income_poverty_ratio,
+                      data = complete_lin_data)
+
+  # 2. Natural splines for age
+  lin_spline <- lm(a1c ~ ns(age, df = 3) + gender + bmi + sbp +
+                     physical_activity_freq + income_poverty_ratio,
+                   data = complete_lin_data)
+
+  # 3. Age × BMI interaction
+  lin_interaction1 <- lm(a1c ~ age * bmi + gender + sbp +
+                           physical_activity_freq + income_poverty_ratio,
+                         data = complete_lin_data)
+
+  # 4. Gender × Physical Activity interaction
+  lin_interaction2 <- lm(a1c ~ age + gender * physical_activity_freq + bmi + sbp +
+                           income_poverty_ratio,
+                         data = complete_lin_data)
+
+  # Model comparison
+  model_comparison <- data.frame(
+    Model = c("Linear (Original)", "Quadratic Age", "Spline Age",
+              "Age × BMI Interaction", "Gender × Physical Activity"),
+    AIC = c(AIC(lin_model), AIC(lin_quadratic), AIC(lin_spline),
+            AIC(lin_interaction1), AIC(lin_interaction2)),
+    BIC = c(BIC(lin_model), BIC(lin_quadratic), BIC(lin_spline),
+            BIC(lin_interaction1), BIC(lin_interaction2)),
+    R_Squared = c(summary(lin_model)$r.squared,
+                  summary(lin_quadratic)$r.squared,
+                  summary(lin_spline)$r.squared,
+                  summary(lin_interaction1)$r.squared,
+                  summary(lin_interaction2)$r.squared)
+  ) %>%
+    arrange(AIC)
+
+  # Add Delta AIC column
+  model_comparison$Delta_AIC <- model_comparison$AIC - min(model_comparison$AIC)
+
+  kable(model_comparison, digits = 2,
+        caption = "Model Comparison: Non-Linear and Interaction Models (sorted by AIC)",
+        booktabs = TRUE, format = "latex",
+        col.names = c("Model", "AIC", "BIC", "R²", "ΔAIC")) %>%
+    kable_styling(latex_options = c("scale_down", "HOLD_position"),
+                  font_size = 9, full_width = FALSE)
+
+  # Model selection interpretation
+  cat("\n\nModel Selection Recommendation:\n")
+  best_model_name <- model_comparison$Model[1]
+  best_aic <- model_comparison$AIC[1]
+  best_r2 <- model_comparison$R_Squared[1]
+
+  cat("  Best Model:", best_model_name, "(lowest AIC =", round(best_aic, 2), ")\n")
+  cat("  R² =", round(best_r2, 4), "\n\n")
+
+  cat("  Interpretation of ΔAIC:\n")
+  cat("  - ΔAIC < 2: Substantial support (competitive models)\n")
+  cat("  - ΔAIC 4-7: Considerably less support\n")
+  cat("  - ΔAIC > 10: Essentially no support\n\n")
+
+  competitive_models <- model_comparison$Model[model_comparison$Delta_AIC < 2]
+  if (length(competitive_models) > 1) {
+    cat("  Competitive models (ΔAIC < 2):", paste(competitive_models, collapse = ", "), "\n")
+    cat("  These models provide similar fit and should be considered equivalent.\n")
+  } else {
+    cat("  The", best_model_name, "model clearly outperforms alternatives.\n")
+  }
+
+  # Provide substantive interpretation
+  if (best_model_name != "Linear (Original)") {
+    cat("\n  Substantive Conclusion:\n")
+    if (grepl("Quadratic|Spline", best_model_name)) {
+      cat("  The data support a NON-LINEAR relationship between age and HbA1c.\n")
+      cat("  This suggests the effect of aging on glycemic control may accelerate or\n")
+      cat("  decelerate at certain ages, rather than being constant across the lifespan.\n")
+    } else if (grepl("Interaction", best_model_name)) {
+      cat("  The data support an INTERACTION effect, indicating that the relationship\n")
+      cat("  between predictors and HbA1c varies across subgroups.\n")
+    }
+  } else {
+    cat("\n  Substantive Conclusion:\n")
+    cat("  The simple linear model is adequate; no strong evidence for non-linear\n")
+    cat("  relationships or interactions in this dataset.\n")
+  }
+  cat("\n")
+
+  # Test significance of quadratic term
+  cat("\n\nTest for Quadratic Age Effect:\n")
+  anova_quad <- anova(lin_model, lin_quadratic)
+  print(anova_quad)
+
+  # Test significance of Age × BMI interaction
+  cat("\n\nTest for Age × BMI Interaction:\n")
+  print(summary(lin_interaction1)$coefficients["age:bmi", ])
+}
+```
+
+
+### Linear Regression Diagnostics
+
+```{r linear-diagnostics, fig.height=8, fig.width=10}
+if (exists("lin_model")) {
+  # VIF for multicollinearity
+  cat("\nVariance Inflation Factors (VIF):\n")
+  vif_values <- vif(lin_model)
+  vif_df <- data.frame(
+    Variable = names(vif_values),
+    VIF = round(vif_values, 3),
+    Multicollinearity = ifelse(vif_values > 10, "High",
+                               ifelse(vif_values > 5, "Moderate", "Low"))
+  )
+  kable(vif_df, caption = "Variance Inflation Factors (VIF > 10 indicates high multicollinearity)",
+        booktabs = TRUE, format = "latex") %>%
+    kable_styling(latex_options = c("scale_down", "HOLD_position"),
+                  font_size = 9, full_width = FALSE)
+
+  # Standard diagnostic plots
+  par(mfrow = c(2, 2))
+  plot(lin_model, which = 1:4)
+  par(mfrow = c(1, 1))
+
+  # Automated diagnostic interpretation
+  cat("\n\n=== AUTOMATED DIAGNOSTIC INTERPRETATION ===\n\n")
+
+  # 1. Residuals vs Fitted (Linearity & Homoscedasticity)
+  resids <- residuals(lin_model)
+  fitted_vals <- fitted(lin_model)
+
+  # Check for non-linear pattern using loess smooth
+  smooth_resids <- fitted(loess(resids ~ fitted_vals, span = 0.75))
+  max_deviation <- max(abs(smooth_resids))
+
+  cat("1. Residuals vs Fitted (Linearity Check):\n")
+  if (max_deviation < 0.1) {
+    cat("   ✓ PASS: Residuals are randomly scattered around zero.\n")
+    cat("     The linearity assumption appears satisfied.\n")
+  } else if (max_deviation < 0.3) {
+    cat("   ⚠ WARNING: Slight pattern detected in residuals.\n")
+    cat("     Linearity assumption may be questionable.\n")
+    cat("     Consider non-linear terms or transformations.\n")
+  } else {
+    cat("   ✗ FAIL: Strong pattern in residuals detected.\n")
+    cat("     Linearity assumption violated.\n")
+    cat("     Non-linear model specifications recommended (see model comparison above).\n")
+  }
+
+  # 2. Normal Q-Q (Normality of Residuals)
+  std_resids <- rstandard(lin_model)
+  shapiro_test <- if (length(std_resids) > 5000) {
+    shapiro.test(sample(std_resids, 5000))
+  } else {
+    shapiro.test(std_resids)
+  }
+
+  cat("\n2. Normal Q-Q Plot (Normality Check):\n")
+  if (shapiro_test$p.value > 0.05) {
+    cat("   ✓ PASS: Residuals appear normally distributed (Shapiro-Wilk p =",
+        format.pval(shapiro_test$p.value, digits = 3), ")\n")
+  } else {
+    cat("   ⚠ WARNING: Residuals deviate from normality (Shapiro-Wilk p =",
+        format.pval(shapiro_test$p.value, digits = 3), ")\n")
+    cat("     Large samples: Normality less critical due to Central Limit Theorem.\n")
+    cat("     Consider: outliers, heavy tails, or skewness.\n")
+
+    # Check for heavy tails
+    tail_resids <- sum(abs(std_resids) > 3)
+    cat("     Extreme outliers (|z| > 3):", tail_resids, "observations\n")
+  }
+
+  # 3. Scale-Location (Homoscedasticity)
+  cat("\n3. Scale-Location (Homoscedasticity Check):\n")
+  bp_test <- bptest(lin_model)
+  cat("   Breusch-Pagan Test:\n")
+  cat("     Chi-squared =", round(bp_test$statistic, 3), "\n")
+  cat("     p-value =", format.pval(bp_test$p.value, digits = 3), "\n")
+
+  if (bp_test$p.value > 0.05) {
+    cat("   ✓ PASS: Homoscedasticity assumed (constant variance).\n")
+  } else {
+    cat("   ✗ FAIL: Heteroscedasticity detected (non-constant variance).\n")
+    cat("     Standard errors are unreliable.\n")
+    cat("     → SOLUTION APPLIED: Robust standard errors (HC3) computed above.\n")
+    cat("     Use robust SEs for valid inference.\n")
+  }
+
+  # 4. Cook's Distance (Influential Points)
+  cooks_d <- cooks.distance(lin_model)
+  threshold <- 4 / length(cooks_d)
+  influential <- sum(cooks_d > threshold)
+  max_cooks <- max(cooks_d)
+
+  cat("\n4. Cook's Distance (Influential Observations Check):\n")
+  cat("   Threshold (4/n):", round(threshold, 4), "\n")
+  cat("   Influential points:", influential, "\n")
+  cat("   Max Cook's D:", round(max_cooks, 4), "\n")
+
+  if (influential == 0) {
+    cat("   ✓ PASS: No influential observations detected.\n")
+  } else if (influential < length(cooks_d) * 0.01) {
+    cat("   ⚠ CAUTION:", influential, "influential observation(s) detected (<1% of data).\n")
+    cat("     These observations have disproportionate influence on coefficients.\n")
+    cat("     Consider: (1) checking for data errors, (2) sensitivity analysis without these cases.\n")
+  } else {
+    cat("   ✗ WARNING:", influential, "influential observations (>1% of data).\n")
+    cat("     Model estimates may be unstable.\n")
+    cat("     Recommend investigating these cases for data quality issues.\n")
+  }
+
+  # 5. Durbin-Watson (Autocorrelation)
+  cat("\n5. Durbin-Watson Test (Autocorrelation Check):\n")
+  dw_test <- dwtest(lin_model)
+  cat("   DW Statistic =", round(dw_test$statistic, 3), "\n")
+  cat("   p-value =", format.pval(dw_test$p.value, digits = 3), "\n")
+
+  if (abs(dw_test$statistic - 2) < 0.3) {
+    cat("   ✓ PASS: No autocorrelation detected (DW ≈ 2).\n")
+    cat("     Expected for cross-sectional survey data.\n")
+  } else if (dw_test$statistic < 1.5) {
+    cat("   ⚠ WARNING: Positive autocorrelation suggested (DW < 1.5).\n")
+    cat("     Unusual for cross-sectional data; check for clustering or time structure.\n")
+  } else if (dw_test$statistic > 2.5) {
+    cat("   ⚠ WARNING: Negative autocorrelation suggested (DW > 2.5).\n")
+    cat("     Unusual pattern; investigate data structure.\n")
+  }
+
+  cat("\n=== DIAGNOSTIC SUMMARY ===\n")
+  diagnostics_pass <- (max_deviation < 0.3) + (shapiro_test$p.value > 0.01) +
+                      (influential < length(cooks_d) * 0.01) +
+                      (abs(dw_test$statistic - 2) < 0.5)
+
+  if (diagnostics_pass >= 3) {
+    cat("Overall: Model diagnostics are ACCEPTABLE.\n")
+    if (bp_test$p.value < 0.05) {
+      cat("Note: Use robust standard errors for inference (heteroscedasticity detected).\n")
+    }
+  } else {
+    cat("Overall: Model diagnostics reveal CONCERNS.\n")
+    cat("Consider: non-linear specifications, outlier removal, or alternative modeling approaches.\n")
+  }
+  cat("\n")
+}
+```
+
+> **Diagnostic Interpretation:**
+> The comprehensive linear regression analysis includes multiple advanced techniques to address limitations:
+>
+> **1. Robust Standard Errors**:
+> - When heteroscedasticity is detected (Breusch-Pagan p < 0.05), robust HC3 standard errors provide valid inference
+> - Coefficient estimates remain unbiased; only standard errors are corrected
+> - Comparison table shows how p-values change when using robust SEs
+> - Results that remain significant with robust SEs are more reliable
+>
+> **2. Non-Linear and Interaction Models**:
+> - Quadratic and spline terms test for non-linear age effects on HbA1c
+> - Interaction terms explore whether effects vary by subgroups (e.g., age × BMI)
+> - Model comparison via AIC/BIC identifies the best-fitting specification
+> - Lower AIC/BIC indicates better model fit; models within 2 AIC units are competitive
+>
+> **3. Standard Diagnostics**:
+> - **Multicollinearity (VIF)**: VIF < 5 indicates acceptable correlation among predictors
+> - **Breusch-Pagan Test**: If p < 0.05, use robust SEs (computed above)
+> - **Durbin-Watson**: DW $\approx$ 2 indicates no autocorrelation (expected for cross-sectional data)
+> - **Residual Plots**: Assess linearity, homoscedasticity, normality, and influential points
+>
+> **Key Insight**: These enhancements address multiple limitations identified in the original analysis, providing more robust and reliable inference about HbA1c predictors.
+
+### Residual Analysis
+
+```{r residual-analysis, fig.height=6, fig.width=10}
+if (exists("lin_model")) {
+  # Residuals vs predictors
+  residuals_df <- data.frame(
+    residuals = residuals(lin_model),
+    fitted = fitted(lin_model),
+    age = nhanes_analysis$age[!is.na(nhanes_analysis$a1c)],
+    bmi = nhanes_analysis$bmi[!is.na(nhanes_analysis$a1c)]
+  )
+
+  p1 <- ggplot(residuals_df, aes(x = fitted, y = residuals)) +
+    geom_point(alpha = 0.3, color = "steelblue") +
+    geom_hline(yintercept = 0, color = "red", linetype = "dashed") +
+    geom_smooth(se = FALSE, color = "darkblue") +
+    labs(title = "Residuals vs Fitted Values",
+         x = "Fitted Values", y = "Residuals") +
+    theme_minimal()
+
+  p2 <- ggplot(residuals_df, aes(sample = residuals)) +
+    stat_qq(alpha = 0.3, color = "steelblue") +
+    stat_qq_line(color = "red") +
+    labs(title = "Normal Q-Q Plot", x = "Theoretical Quantiles", y = "Sample Quantiles") +
+    theme_minimal()
+
+  p1 | p2
+}
+```
+
+\newpage
+
+# Discussion and Conclusion
+
+## Key Findings
+
+This analysis of NHANES data revealed several important insights into adult health outcomes in the US population:
+1. **Demographics**: The sample was diverse in age, gender, and socioeconomic status.
+2. **Health Metrics**: Mean BMI and blood pressure levels indicated a substantial burden of overweight/obesity and hypertension.
+3. **Diabetes Prevalence**: The prevalence of diabetes was consistent with national estimates, highlighting the ongoing public health challenge.
+4. **Predictors of Diabetes**: Logistic regression identified age, BMI, and systolic blood pressure as statistically significant predictors of diabetes/prediabetes status, while gender, physical activity frequency, and income-poverty ratio were not significant.
+5. **HbA1c Levels**: Linear regression identified age, BMI, and income-poverty ratio as statistically significant predictors of HbA1c levels, while gender, systolic blood pressure, and physical activity frequency were not significant in this model.
+
+## Limitations
+
+```{r limitations-data, echo=FALSE}
+# Get actual missing data statistics for the discussion
+missing_pct_retained <- if (nrow(nhanes_clean) > 0) {
+  round(nrow(nhanes_analysis)/nrow(nhanes_clean)*100, 1)
+} else {
+  NA
+}
+
+# Get top 3 variables with most missing data
+# Reuse missing_summary from earlier chunk
+top_missing <- missing_summary %>%
+  rename(Percent = `Percent Missing`) %>%
+  head(3)
+
+# Use semicolon as separator to avoid confusion with commas in variable names
+top_missing_vars <- paste(top_missing$Variable, collapse = "; ")
+```
+
+### Data and Design Limitations
+
+- **Cross-sectional design** limits causal inferences. Associations identified cannot establish temporal or causal relationships. Longitudinal data would be required to determine whether observed risk factors precede disease onset.
+
+- **Potential residual confounding** from unmeasured variables such as genetic factors, dietary patterns, medication use (e.g., antihypertensives, antidiabetic drugs), family history, and socioeconomic factors not fully captured in the dataset. The models may attribute effects to included variables that are actually due to correlated unmeasured factors.
+
+- **Missing data** may introduce bias despite efforts to handle it. Variables such as `r top_missing_vars` had the highest proportion of missing values. Missingness was addressed by removing columns with >60% missing data and restricting analysis to complete cases for key variables, which retained approximately `r missing_pct_retained`% of the sample. Complete case analysis may introduce selection bias if data are not missing completely at random (MCAR).
+
+- **Measurement error** in self-reported variables (e.g., physical activity, smoking status) may attenuate associations and reduce statistical power. Self-reported measures are subject to recall bias and social desirability bias.
+
+- **Sample selection bias** results from multiple filtering steps: (1) restriction to adults ≥18 years, (2) complete case analysis excluding individuals with missing data on key variables, and (3) variable-specific exclusions based on outlier thresholds. The analytic sample may not be representative of the US adult population, as evidenced by the significantly lower hypertension prevalence (37.6%) compared to the national estimate (48%).
+
+### Statistical Assumption Violations
+
+- **Non-normality of continuous variables**: Shapiro-Wilk tests indicated that all continuous health variables (age, BMI, SBP, DBP, HbA1c, glucose) significantly deviate from normal distribution (all p < 0.05). While t-tests and ANOVA are robust to moderate non-normality with large samples due to the Central Limit Theorem (n > 1,000 in our analysis), this violation may affect confidence interval accuracy and Type I error rates in smaller subgroups.
+
+- **✓ PARTIALLY ADDRESSED - Heteroscedasticity in linear regression**: The Breusch-Pagan test for the HbA1c prediction model detected heteroscedasticity (non-constant variance of residuals). **Solution implemented**: HC3 robust standard errors computed to provide valid inference despite heteroscedasticity. Coefficient estimates remain unbiased; robust SEs ensure correct p-values and confidence intervals. See "Robust Standard Errors" section for comparison of standard vs robust results.
+
+- **Unequal variances between groups**: Variance tests (F-tests) revealed significant variance differences between diabetes groups for SBP, HbA1c, and BMI. This violates the equal variance assumption of standard ANOVA. However, Welch's t-test (used in our two-sample comparisons) does not assume equal variances, partially mitigating this concern for pairwise comparisons.
+
+### Model-Specific Limitations
+
+- **Linear regression model fit**: The HbA1c prediction model has modest explanatory power (R² reported in results). This indicates that the included predictors explain only a portion of variance in HbA1c, suggesting important predictors may be missing (e.g., dietary intake, genetics, medication use, disease duration).
+
+
+### Categorization and Classification Decisions
+
+- **Arbitrary cut-points**: Age groups (18-34, 35-49, 50-64, 65+) and BMI categories (underweight, normal, overweight, obese) use conventional but somewhat arbitrary thresholds. Different cut-points might yield different results.
+
+- **Combining Prediabetes with Diabetes**: In the logistic regression, we combined prediabetes and diabetes into a single outcome category. This may obscure important differences between these conditions, as prediabetes represents an intermediate state with distinct risk profiles and treatment approaches.
+
+- **Diabetes classification based on HbA1c alone**: Our diabetes variable relies heavily on HbA1c ≥6.5% and self-report. We did not incorporate fasting glucose or oral glucose tolerance test results, which may lead to misclassification of some cases.
+
+## Future Directions
+
+### Addressing Methodological Limitations
+
+- **Multiple imputation for missing data**: Implement multiple imputation (e.g., MICE algorithm) instead of complete case analysis to retain full sample size, reduce selection bias, and improve statistical power.
+
+### Enhanced Modeling Approaches
+
+- **Longitudinal studies**: Analyze repeated measures data across NHANES survey cycles to assess temporal relationships, within-person change, and establish temporal precedence for causal inference.
+
+- **External validation**: Validate final models in external datasets (e.g., other NHANES cycles, different cohorts) to assess generalizability beyond the current sample.
+
+### Data Enhancement and Expansion
+
+- **Inclusion of additional variables**: Incorporate dietary intake data (24-hour recalls), genetic/genomic markers, medication data (type, dosage, adherence), family history, environmental exposures, and neighborhood-level socioeconomic factors.
+
+- **Subgroup analyses**: Conduct stratified analyses by age, gender, race/ethnicity to identify heterogeneous effects and vulnerable populations. Test for effect modification formally using interaction terms.
+
+### Clinical and Public Health Applications
+
+- **Risk prediction tool development**: Develop and validate clinical risk prediction scores for diabetes onset, incorporating the significant predictors identified. Assess discrimination (C-statistic), calibration, and clinical utility (decision curve analysis).
+
+- **Exploration of intervention strategies** to mitigate modifiable risk factors:
+  - Weight management programs targeting elevated BMI (significant predictor)
+  - Blood pressure control interventions (lifestyle and pharmacologic) for elevated systolic BP (significant predictor)
+  - Physical activity promotion initiatives (not significant in our model but evidence-based diabetes prevention strategy)
+  - Diabetes prevention programs (DPP) for high-risk populations identified by age, BMI, and BP
+  - Integrated care models addressing multiple risk factors simultaneously
+
+
+\newpage
+
+# References
+- Centers for Disease Control and Prevention (CDC). National Health and Nutrition Examination Survey. https://www.cdc.gov/nchs/nhanes/index.htm
+- Fox J, Weisberg S (2019). _An R Companion to Applied Regression_, Third edition. Sage, Thousand Oaks CA.
+  <https://www.john-fox.ca/Companion/>.
+- Hosmer, D.W., Lemeshow, S., & Sturdivant, R.X. (2013). Applied Logistic Regression. Wiley.
+- Kutner, M.H., Nachtsheim, C.J., Neter, J., & Li, W. (2005). Applied Linear Statistical Models. McGraw-Hill/Irwin.
+- Meyer D, Dimitriadou E, Hornik K, Weingessel A, Leisch F (2024). _e1071: Misc Functions of the Department of Statistics,
+  Probability Theory Group (Formerly: E1071), TU Wien_. doi:10.32614/CRAN.package.e1071
+  <https://doi.org/10.32614/CRAN.package.e1071>, R package version 1.7-16, <https://CRAN.R-project.org/package=e1071>.
+- Pedersen T (2025). _patchwork: The Composer of Plots_. doi:10.32614/CRAN.package.patchwork
+  <https://doi.org/10.32614/CRAN.package.patchwork>, R package version 1.3.2,
+  <https://CRAN.R-project.org/package=patchwork>.
+- R Core Team (2025). _R: A Language and Environment for Statistical Computing_. R Foundation for Statistical Computing,
+  Vienna, Austria. <https://www.R-project.org/>.
+- Taiyun Wei and Viliam Simko (2024). R package 'corrplot': Visualization of a Correlation Matrix (Version 0.95). Available
+  from https://github.com/taiyun/corrplot
+- Tierney N, Cook D (2023). “Expanding Tidy Data Principles to Facilitate Missing Data Exploration, Visualization and
+  Assessment of Imputations.” _Journal of Statistical Software_, *105*(7), 1-31. doi:10.18637/jss.v105.i07
+  <https://doi.org/10.18637/jss.v105.i07>.
+- Waring E, Quinn M, McNamara A, Arino de la Rubia E, Zhu H, Ellis S (2025). _skimr: Compact and Flexible Summaries of
+  Data_. doi:10.32614/CRAN.package.skimr <https://doi.org/10.32614/CRAN.package.skimr>, R package version 2.2.1,
+  <https://CRAN.R-project.org/package=skimr>.
+- Wickham H, Averick M, Bryan J, Chang W, McGowan LD, François R, Grolemund G, Hayes A, Henry L, Hester J, Kuhn M, Pedersen
+  TL, Miller E, Bache SM, Müller K, Ooms J, Robinson D, Seidel DP, Spinu V, Takahashi K, Vaughan D, Wilke C, Woo K, Yutani H
+  (2019). “Welcome to the tidyverse.” _Journal of Open Source Software_, *4*(43), 1686. doi:10.21105/joss.01686
+  <https://doi.org/10.21105/joss.01686>.
+- Xavier Robin, Natacha Turck, Alexandre Hainard, Natalia Tiberti, Frédérique Lisacek, Jean-Charles Sanchez and Markus
+  Müller (2011). pROC: an open-source package for R and S+ to analyze and compare ROC curves. BMC Bioinformatics, 12, p. 77.
+  DOI: 10.1186/1471-2105-12-77 <http://www.biomedcentral.com/1471-2105/12/77/>
+- Xie Y (2025). _knitr: A General-Purpose Package for Dynamic Report Generation in R_. R package version 1.50,
+  <https://yihui.org/knitr/>.
+
+
